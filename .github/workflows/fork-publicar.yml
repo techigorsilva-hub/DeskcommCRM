@@ -1,0 +1,56 @@
+name: Fork — publicar versão
+
+# Publica a versão do fork que a VPS instala: tag vX.Y.Z → build das quatro
+# imagens no GHCR do dono do fork → release do GitHub (só depois das imagens).
+#
+# Dispara sozinho quando um PR de sincronização entra na main (muda
+# .fork/versao-original). Para publicar uma mudança SUA entre duas versões do
+# original: aba Actions → este workflow → "Run workflow" (sai como patch,
+# ex.: 1.86.1).
+#
+# Recusa publicar se a main carregar código do original ainda não lançado.
+# Detalhes: FORK.md
+
+on:
+  push:
+    branches: [main]
+    paths: [".fork/versao-original"]
+  workflow_dispatch: {}
+
+concurrency:
+  group: fork-publicar
+  cancel-in-progress: false
+
+# Quem escreve é a chave FORK_TOKEN (ver o passo de conferência); o token
+# padrão do Actions só precisa ler.
+permissions:
+  contents: read
+
+# Comentário em `jobs:` deliberado — ver fork-sincronizar.yml e FORK.md.
+jobs: # fork
+  publicar:
+    runs-on: ubuntu-latest
+    # O build das 8 imagens (4 × amd64/arm64) leva de 15 a 25 minutos, e este
+    # job espera por ele antes de criar a release.
+    timeout-minutes: 90
+    steps:
+      - name: Conferir a chave FORK_TOKEN
+        env:
+          FORK_TOKEN: ${{ secrets.FORK_TOKEN }}
+        run: |
+          if [ -z "$FORK_TOKEN" ]; then
+            echo "::error::Falta o segredo FORK_TOKEN. O token padrão do Actions é proibido pelo GitHub de enviar commits que mexem em .github/workflows — e as versões do original mexem. Crie a chave e cadastre o segredo: ver FORK.md, seção 'A chave FORK_TOKEN'."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          # O push sai com a chave do dono (FORK_TOKEN), não com o GITHUB_TOKEN.
+          token: ${{ secrets.FORK_TOKEN }}
+
+      - name: Tag, imagens e release
+        env:
+          GH_TOKEN: ${{ secrets.FORK_TOKEN }}
+        run: bash .fork/publicar.sh
