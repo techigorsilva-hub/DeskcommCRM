@@ -1,0 +1,60 @@
+name: Fork — sincronizar com o original
+
+# Toda segunda-feira confere se o projeto original (UPSTREAM_REPO, em
+# .fork/config.sh) lançou versão nova. Se lançou: abre uma Issue (a sua tarefa) com as
+# novidades e os pontos de atenção e, quando a junção com o seu código é
+# limpa, um PR pronto para aprovar. Nunca mexe na main sozinho.
+#
+# Para rodar fora de hora: aba Actions → este workflow → "Run workflow".
+# Detalhes: FORK.md
+
+on:
+  schedule:
+    # Segunda, 08:17 de Brasília (11:17 UTC). Minuto quebrado de propósito:
+    # o topo da hora é o horário mais congestionado do agendador do GitHub.
+    - cron: "17 11 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: fork-sincronizar
+  cancel-in-progress: false
+
+# Código, branch e PR saem com a chave FORK_TOKEN (ver o passo de conferência).
+# A TAREFA (Issue) sai com o token padrão, em nome de github-actions[bot]: o
+# GitHub não notifica ninguém sobre o que a própria pessoa fez, e uma Issue
+# aberta com a chave do dono não chegaria a ele nem por e-mail nem no celular.
+permissions:
+  contents: read
+  issues: write   # abrir a tarefa e comentar nela como github-actions[bot]
+
+# O comentário na linha de `jobs:` é deliberado. Os testes de governança do
+# original (tests/unit/gatilho-dos-jobs-de-entrega.test.ts e irmãos) mapeiam
+# os jobs DOS WORKFLOWS DELE e reprovam job desconhecido; os workflows deste
+# fork ficam fora dessa varredura para que nenhum arquivo do original precise
+# ser editado — e, portanto, nunca entre em conflito. Ver FORK.md.
+jobs: # fork
+  sincronizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Conferir a chave FORK_TOKEN
+        env:
+          FORK_TOKEN: ${{ secrets.FORK_TOKEN }}
+        run: |
+          if [ -z "$FORK_TOKEN" ]; then
+            echo "::error::Falta o segredo FORK_TOKEN. O token padrão do Actions é proibido pelo GitHub de enviar commits que mexem em .github/workflows — e as versões do original mexem. Crie a chave e cadastre o segredo: ver FORK.md, seção 'A chave FORK_TOKEN'."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          # O push sai com a chave do dono (FORK_TOKEN), não com o GITHUB_TOKEN.
+          token: ${{ secrets.FORK_TOKEN }}
+
+      - name: Conferir o original e abrir a tarefa
+        env:
+          GH_TOKEN: ${{ secrets.FORK_TOKEN }}
+          BOT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .fork/sincronizar.sh
