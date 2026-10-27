@@ -271,7 +271,7 @@ consertos estão em commits próprios desta branch — procure pelas palavras ab
 |---|------|-------------|
 | J5.1 | Admin convida atendente pela UI (sem Resend) | UI diz a verdade + accept_url copiável |
 | J5.2 | Convidado abre link, cria sessão, aceita | vira membro agent, cai no inbox |
-| J5.3 | Atendente vê APENAS fila + suas conversas | escopo RLS na prática |
+| J5.3 | Atendente vê APENAS fila + suas conversas | escopo RLS na prática; a autorização dos anexos e da reprodução AAC também é conferida pela rota real em `tests/e2e/inbox-scope.spec.ts`, com recursos sintéticos de duas organizações. **Cobertura preparada; execução real pendente no CI.** O teste de rota com Storage dublê está em `tests/unit/midia-da-mensagem-isolamento.test.ts` |
 | J5.4 | Atendente dá claim numa conversa da fila | claim ok; 2º atendente levando 409 amigável |
 | J5.5 | Transferir conversa pra colega | imediata, contador de não-lidas zera pro novo dono |
 | J5.6 | Atendente tenta ver billing/api-tokens | 403 página amigável |
@@ -532,8 +532,15 @@ oficial, o formulário oferece os modelos aprovados DAQUELE número
 a mesma do inbox). Migration 0710.
 
 Spec: `tests/e2e/campanha-com-modelo-aprovado.spec.ts`, na `SPECS_PARTE_5`. Os
-casos 1 e 2 rodam no CI; o 3 precisa do dublê do provedor (ambiente do
-`next start`) e pula sem ele — o comando está no cabeçalho da spec.
+casos 1, 2 e o da escolha do envio rápido rodam no CI; o envio de teste e a
+rodada rápida precisam do dublê do provedor (ambiente do `next start`) e pulam
+sem ele — o comando está no cabeçalho da spec.
+
+Envio rápido (migration 0711, 2026-10-16): `campaigns.velocidade` (`gradual` |
+`rapida`, só com modelo). Na rápida, a rodada do cron manda em rajada
+(`lib/campanhas/rajada.ts`: 6 inícios por segundo, 4 em voo, até 38 s por
+rodada) em vez de uma mensagem por rodada; o 429 do provedor e o 130429 da
+plataforma devolvem a pessoa à fila em vez de falhá-la.
 
 | # | Caso | Expectativa | Resultado |
 |---|------|-------------|-----------|
@@ -543,6 +550,8 @@ casos 1 e 2 rodam no CI; o 3 precisa do dublê do provedor (ambiente do
 | J52.4 | Enviar teste (com o dublê do provedor) | o provedor recebe nome, idioma, `templateParams` na ordem do contrato e `headerMedia`; a conversa guarda o modelo com o texto preenchido | **PASS pela tela, local** — `evidence/campanha-com-modelo-aprovado/05-teste-enviado.png`; no CI pula (sem dublê) |
 | J52.5 | Falha da plataforma no envio | da pessoa (131050, 131049, 131026) segue para a próxima com o motivo em frase; do envio inteiro (132015, 131048, 131042…) pausa a campanha com o motivo | **PASS (unit)** — `lib/channels/erro-da-plataforma.test.ts`; rodada **NÃO MEDIDA** pela tela |
 | J52.6 | Entrega e leitura pelo oficial direto | o trigger de ack lê `delivered_at`/`read_at` e o destinatário vira entregue/lido | **PASS (banco)** — do #2937: `tests/invariants/ack-da-api-oficial-alcanca-o-destinatario.test.ts` |
+| J52.7 | Escolher «Rápido» no ritmo de uma campanha do número oficial (migration 0711) | a campanha que já existia vem «Gradual»; «Rápido» grava `velocidade = rapida`, some o campo de intervalo, e a confirmação de «Iniciar envio» diz «Envio rápido: sai tudo em cerca de 1 min.» | **PASS pela tela + banco** (2026-10-16) — `evidence/campanha-com-modelo-aprovado/06-envio-rapido-escolhido.png` |
+| J52.8 | Campanha rápida de 3 pessoas, uma rodada do cron (com o dublê do provedor) | o provedor recebe os 3 modelos, cada um com o primeiro nome da pessoa; os 3 destinatários ficam `sent`, a campanha `completed`, e a tela mostra «Enviadas 3» | **PASS pela tela, local** (2026-10-16) — `evidence/campanha-com-modelo-aprovado/07-rapida-lista-inteira-numa-rodada.png`; no CI pula (sem dublê) |
 
 ## J9 — Ver o que o follow-up já fez, e intervir sem matá-lo `[P1]`
 
@@ -1779,6 +1788,7 @@ CI — a coluna abaixo diz QUEM mede, não o que foi medido.
 | J49.5 (A-5) | Gesto de voltar do sistema | devolve a lista, sem `id=` | E2E (CI) |
 | J49.6 (A-6) `[P0]` | WhatsApp desconectado | com a faixa na tela o documento não rola (`scrollY` ≤ 1 depois de `scrollTo` ao fim); aberta a conversa, topo da camada = base das faixas (±1), a faixa continua por cima (`elementFromPoint`), o composer termina ≤ 844 e a barra de voltar fica abaixo da faixa; de volta à lista e com a página rolada (espaçador de 3000px no `<main>`), o topo do `<header>` sticky = base das faixas (±1) e `elementFromPoint` no topo dele cai no header | E2E (CI, conexão `FAILED` semeada e apagada no `finally`, com a remoção conferida) + UNIT `faixas-de-cima` |
 | J49.7 (A-7) | Teclado aberto, modelo Android | janela de 500px: `data-teclado-aberto`, fileira de ações escondida, último balão dentro do fio e composer ≤ 500 | E2E (CI) + UNIT `altura-visivel` |
+| J49.8 (A-8) | A ficha do contato no celular | aberta pelo «Ficha» (folha): «Tags do contato», «Novo Lead», «Ver contato», o campo «Nova tag…» ≥ 44 de altura; «Adicionar tag» ≥ 44×44 (o gatilho da cor, só de `manager+`, não é medido: a spec entra como `agent`) — a ficha sobrescrevia os 44px do primitivo com `h-7` (28px); acima de `lg` a densidade de mouse fica (`lg:h-7`) | E2E (CI); evidência `evidence/atender-pelo-celular-20261021/a8-ficha-alvos-de-toque.png` |
 
 **NÃO MEDIDO — só o aparelho prova:** o teclado do iOS (que NÃO encolhe a
 janela: ali quem mede é o `visualViewport.offsetTop`, e a fórmula da camada com
@@ -3910,3 +3920,59 @@ código e a hora anteriores e se houve confirmação).
 **NÃO COBERTO, declarado:** que o canal de verdade entrega o reenvio (o CI não tem
 WhatsApp; o caminho termina em «Não enviada — sem conexão»); o toque num iPhone e num
 Android reais; o reenvio de mídia pela tela (coberto só pela regra e pela rota).
+
+## Conferência integrada de correções — 26/10/2026
+
+[Registro do lote #3462](lote-3462-2026-10-26.md): oito contribuições provadas numa
+aplicação compilada, com banco fresco, navegador, Storage, Realtime, autorização e
+webhook assinado reais. O registro delimita cada PASS, a autoria e os serviços externos
+que não foram medidos; capturas e traces contêm somente dados sintéticos.
+
+## Controles do topo — nome acessível `[P1]` (2026-10-26, PR #3409)
+
+O seletor de idioma e o menu da pessoa incluem seus textos visíveis (PT/ES e
+iniciais) no nome acessível, sem mudar a aparência. O Axe 4.14 encontrou a ausência
+na regra `label-content-name-mismatch`, nos dois casos de `rbac-roles.spec.ts`:
+admin com MFA em API Tokens/cobrança e atendente no Inbox/Funis.
+
+**PASS pela tela:** os mesmos dois casos, sem excluir a regra do Axe, em banco
+fresco do `baseline.sql` com `ON_ERROR_STOP=1`, `bootstrap-owner.ts`, contas
+sintéticas e build de produção, no candidato `bfca6673f` sobre a base `bb7b6cb33`.
+Capturas dos dois casos e traces foram inspecionados; evidência local em
+`.superpowers/evidence/pr3409-01a178b3/`. O unitário
+`tests/unit/controles-do-topo-nome-acessivel.test.tsx` cobre os nomes em PT/ES e
+iniciais com nome completo, um nome e fallback pelo e-mail: 8 vermelhos antes,
+8 verdes depois. **Não medido:** reconhecimento de voz em aparelho real e o
+fluxo inteiro em espanhol (a cobertura em espanhol aqui é do componente).
+
+## Atendimento e follow-ups — integração #3475 (2026-10-26)
+
+**Medido em bancada sintética real:** build de produção `20f335eae` /
+`cyznjcUkNaQa9Fn5H6iU4`, Supabase próprio com baseline install/update
+`ON_ERROR_STOP=1`, GoTrue e Realtime. [Relatório e limites](../../evidence/atendimento-followups-3475/README.md).
+Os seis cenários passaram em rodadas dirigidas, sem reivindicar a suíte inteira:
+
+| Caso | Resultado observado |
+| --- | --- |
+| Cancelar dormente/coletando no dossiê | PASS: fila → dossiê → estado/timeline imediato, banco/evento, reload e tick sem despertar; viewer403 e outra org404 |
+| Parar dormente pelo Inbox | PASS: botão antes, inscrição cancelled/sem relógio, reload carregado sem Parar e com seletor para Iniciar |
+| Enviar por integração em nome de atendente | PASS: transporte e pausa de cinco minutos reais; token puro não pausa, sem escopo403, retorno automático na tela após o prazo |
+| Assinatura de automação e Prospecção | PASS: produtores reais, provider HTTP controlado, assinatura exata no receiver WAHA, mensagem persistida e corpo no Inbox |
+| Filtro/âncora dos avisos | PASS no recorte INSERT/Realtime, toast, rota autenticada e decisão do job Web Push: palavra recusada/aceita, mídia sem texto e agente já engajado |
+| ACK fora de ordem e recuperação | PASS: UI → receiver; webhook HMAC, read não regride por2/1/-1; failed não recupera por1, recupera por2/3; indicador/reload e isolamento tenant |
+| Bolha invisível no turno real | PASS da guarda: webhook HMAC → pós-entrada → drain/claim/fronteira/handler; U+200E recusado com corpo_vazio observado no HTTP do provider e traço canônico não dry-run, sem outbound/HTTP WAHA. Controle legível completou com assinatura e bolha |
+
+**Limites:** a tentativa invisível termina por HTTP400 intencional do provider
+depois da recusa, para limitar a prova; não mede reescrita autônoma. O sandbox
+intercepta a tool antes dessa guarda e não foi aceito como prova. Nos quatro
+controles de avisos não foi medido o despacho completo da IA pela pós-entrada/handler;
+a âncora é histórico sintético persistido. Entrega de Push/FCM não foi medida
+(envelope não recebido), nem modelo/WhatsApp externos. PG15 foi usado na bancada
+Supabase; os invariantes PG17 são do CI.
+
+**Achados da bancada:** preflight confundia UUID reservado do candidato com envio;
+Prospecção exige admin, ferramenta e funil publicados; INSERT anterior ao JOIN
+Realtime perdia o toast; ausência de botão durante reload ainda vazio não prova
+estado. O runner foi corrigido e as tentativas/capturas antigas foram conservadas
+com esses limites. O manager original não foi promovido, os guards do produto
+não foram alterados e os recursos exclusivos foram removidos ao fim.
