@@ -26,6 +26,7 @@ import {
   MOTIVO_COMANDO_OFF,
   pausarIaDuravelmente,
   pausarIaPorAtendimentoManual,
+  type FalhaDaPausa,
 } from "@/lib/escalacao/atendimento-manual";
 import { agenteAceitaComandoDeCelular, lerComandoDeControle } from "@/lib/escalacao/comando-de-canal";
 import { devolverAtendimentoAoAgente } from "@/lib/escalacao/retomada";
@@ -34,11 +35,12 @@ import { acelerarPipelineDeEventos } from "@/lib/dev/kick-local-pipeline";
 import { canonicalPhoneBR } from "@/lib/channels/phone-variants";
 import { estamparAtribuicaoDoContato, metadataDoAnuncio } from "@/lib/leads/atribuicao-de-anuncio";
 import { ancoraCtwaDaMensagem } from "@/lib/leads/prova-meta-lead-submitted";
-import { extrairEEstamparAtribuicaoGoogle } from "@/lib/plataformas-de-anuncio/google/atribuicao";
 import { extrairAtribuicaoWaha } from "@/lib/waha/atribuicao-de-anuncio";
 import { criarIngestDeGrupoDb, gravarMensagemDeGrupo } from "@/lib/grupos/ingest";
 import type { RemetenteDeGrupo } from "@/lib/messaging/remetente-de-grupo";
 import { previaDaMensagem } from "@/lib/messaging/previa-da-mensagem";
+import { PREVIA_DA_APAGADA_PELO_CONTATO } from "@/lib/messaging/texto-retido";
+import { corpoDaLocalizacao, lerLocalizacao, type Localizacao } from "@/lib/messaging/localizacao";
 import { semAssinatura } from "@/lib/messaging/assinatura";
 import type { createAdminClient } from "@/lib/supabase/admin";
 import { ackToStatus } from "@/lib/types/messaging";
@@ -57,6 +59,27 @@ import {
 import { consumirRespostaDoSuporteNoWhatsApp } from "@/lib/escalacao/resposta-whatsapp-ao-caso";
 
 export type Admin = ReturnType<typeof createAdminClient>;
+
+/**
+ * Aviso durável de que a pausa da IA NÃO foi garantida (#534) — o `#off` e a
+ * resposta manual pelo celular passam por `pausarIaPorAtendimentoManual` com
+ * `avisar`, e é aqui que a
+ * falha fica registrada com motivo nomeado. A ingestão segue (perder mensagem é
+ * pior que duplicar); o que não segue é a mentira de que a IA está pausada.
+ */
+function avisarPausaNaoGravada(falha: FalhaDaPausa): Promise<void> {
+  return audit({
+    action: "ai.pausa_nao_gravada",
+    organizationId: falha.organizationId,
+    resourceType: "conversation",
+    resourceId: falha.conversationId,
+    metadata: {
+      canal: falha.canal ?? "waha",
+      motivo: falha.motivo,
+      detalhe: falha.detalhe ?? null,
+    },
+  });
+}
 
 /**
  * A pausa da IA quando uma pessoa responde pelo celular vive em
@@ -533,6 +556,8 @@ const NOWEB_MESSAGE_KEY_TYPE: Record<string, string> = {
 
 export function resolveMessageType(p: WahaPayload): string {
   if (p.type) return mapWahaMessageType(p.type);
+  // NOWEB não manda `type`: o pino se reconhece pelas coordenadas legíveis.
+  if (localizacaoDoPayload(p)) return "location";
   const msg = p._data?.message;
   if (msg && typeof msg === "object") {
     for (const [key, mapped] of Object.entries(NOWEB_MESSAGE_KEY_TYPE)) {
@@ -554,8 +579,44 @@ export function notifyNameOf(p: WahaPayload): string | null {
   return p._data?.notifyName ?? p._data?.pushName ?? null;
 }
 
+/**
+ * A LOCALIZAÇÃO (pino) da mensagem, ou null.
+ *
+ * O WAHA entrega o pino com `body` VAZIO e as coordenadas em `location`
+ * (`WALocation`); o NOWEB também as deixa em `_data.message.locationMessage`
+ * (`degreesLatitude`/`degreesLongitude`, como o Baileys). Sem ler nenhum dos
+ * dois, a guarda de "mensagem sem corpo nem mídia" descartava o pino — nas DUAS
+ * direções, sem log: o cliente mandava a localização e a conversa não a mostrava;
+ * o dono mandava do celular e ela sumia do CRM (medido numa instalação real em
+ * 02/11/2026: em 30 dias, nenhum pino gravado pelo número pareado, 22 pelo oficial).
+ *
+ * A leitura e a validação são as de todo canal (`lib/messaging/localizacao.ts`):
+ * fora da faixa da Terra, ou (0, 0), é null.
+ */
+export function localizacaoDoPayload(p: WahaPayload): Localizacao | null {
+  const direta = lerLocalizacao(p.location);
+  if (direta) return direta;
+  const msg = p._data?.message;
+  if (!msg || typeof msg !== "object") return null;
+  const m = msg as { locationMessage?: unknown; liveLocationMessage?: unknown };
+  const pino = m.locationMessage ?? m.liveLocationMessage;
+  if (!pino || typeof pino !== "object") return null;
+  const o = pino as Record<string, unknown>;
+  return lerLocalizacao({
+    latitude: o.degreesLatitude,
+    longitude: o.degreesLongitude,
+    name: o.name,
+    address: o.address,
+  });
+}
+
 /** Corpo textual: WAHA nem sempre preenche `body` em cartões de contato NOWEB. */
 export function bodyOf(p: WahaPayload): string | null {
+  // O pino vira o corpo legível de todo canal (nome/endereço + link do mapa) —
+  // é o que o agente lê e a prévia da lista mostra. Antes de `p.body`: no WEBJS
+  // o `body` de uma localização é a miniatura em base64, não texto.
+  const pino = localizacaoDoPayload(p);
+  if (pino) return corpoDaLocalizacao(pino);
   if (p.body) return p.body;
   const msg = p._data?.message;
   if (!msg || typeof msg !== "object") return null;
@@ -1174,11 +1235,6 @@ async function handleInbound(
   const atribuicao = extrairAtribuicaoWaha(p._data?.message);
   if (atribuicao) await estamparAtribuicaoDoContato(admin, session.organization_id, contactId, atribuicao);
 
-  // Irmão do bloco acima, para o Google: o token vem no PRÓPRIO texto da
-  // mensagem (não há payload de ad-reply equivalente para essa plataforma) —
-  // ver o cabeçalho de `lib/plataformas-de-anuncio/google/atribuicao.ts`. Best-effort.
-  await extrairEEstamparAtribuicaoGoogle(admin, session.organization_id, contactId, texto);
-
   const conversationId = await upsertConversation(admin, session.organization_id, contactId, session.id);
   if (!conversationId) return;
 
@@ -1214,6 +1270,9 @@ async function handleInbound(
       metadata: {
         raw_type: p.type,
         ack_name: p.ackName,
+        // O pino em `metadata.location` é o que a tela desenha (`LocationCard`) e o
+        // que `localizacaoDaMensagem` lê — a mesma chave do canal oficial.
+        ...(localizacaoDoPayload(p) ? { location: localizacaoDoPayload(p) } : {}),
         // O texto citado só entra quando NÃO há ponteiro: com a linha
         // resolvida, a citada no banco é a fonte da verdade — uma edição
         // posterior mudaria o que a tela mostra, e a cópia ficaria velha.
@@ -1520,7 +1579,8 @@ async function handleOutboundFromUserPhone(
   // como `fromMe`, e só o dedup por `external_id` a reconhece como nossa.
   const grupo = grupoDoEnvio(p, chatId);
   if (!p.id) return;
-  if (!p.body && !mediaUrlOf(p) && !p.hasMedia) return;
+  // O pino não tem `body` nem mídia: sem a terceira condição ele era descartado aqui.
+  if (!p.body && !localizacaoDoPayload(p) && !mediaUrlOf(p) && !p.hasMedia) return;
   // Idem inbound. Aqui o caso que mais dói é o chatId vazio: é literalmente o
   // defeito do #108 — mensagem que o dono digitou no celular sem `to`, sem id
   // composto e sem `from`. Se voltar a acontecer por um formato novo, agora sai
@@ -1668,6 +1728,8 @@ async function handleOutboundFromUserPhone(
       metadata: {
         raw_type: p.type,
         fromMe: true,
+        // O pino que o dono mandou do celular: mesma chave do inbound.
+        ...(localizacaoDoPayload(p) ? { location: localizacaoDoPayload(p) } : {}),
         // Mesmo critério do inbound: cópia do texto só quando não há ponteiro.
         ...(citacao?.texto && !citadaId ? { reply_to_body: citacao.texto } : {}),
         // Mesma regra do inbound (#2613): nome só quando há nome.
@@ -1771,6 +1833,7 @@ async function handleOutboundFromUserPhone(
         conversationId,
         canal: "waha",
         motivo: MOTIVO_COMANDO_OFF,
+        avisar: avisarPausaNaoGravada,
       });
     } else if (comandoAplicado === "on") {
       const devolucao = await devolverAtendimentoAoAgente(
@@ -1794,11 +1857,13 @@ async function handleOutboundFromUserPhone(
         });
       }
     } else {
+      // #534: o aviso é o que impede a falha da pausa de virar um `false` mudo.
       await pausarIaPorAtendimentoManual(admin, {
         organizationId: session.organization_id,
         conversationId,
         canal: "waha",
         duravel: aceita,
+        avisar: avisarPausaNaoGravada,
       });
     }
     // O comando não é fala de atendimento: esconde do cliente depois de aplicar.
@@ -2242,7 +2307,7 @@ async function handleMessageRevoked(
     // trilha dizendo que alguém apagou pelo celular — numa tabela append-only.
     // Pelo mesmo filtro, a reentrega do mesmo evento não duplica a trilha.
     .is("revoked_at", null)
-    .select("id, conversation_id, direction, external_id");
+    .select("id, conversation_id, direction, external_id, sent_at");
   if (erroDoCarimbo) {
     // Sem este ramo o evento "some" em silêncio e a mensagem apagada segue
     // legível como se ninguém tivesse apagado — o modo de falha que este arquivo
@@ -2273,6 +2338,36 @@ async function handleMessageRevoked(
         conteudo_preservado: true,
       },
     });
+
+    // A PRÉVIA DA LISTA NÃO PODE DENUNCIAR O QUE O CONTATO APAGOU (#4500).
+    //
+    // `conversations.last_message_preview` é o que a lista da Inbox MOSTRA e o
+    // que a busca filtra (`ilike`, `app/api/v1/conversations/_handler.ts`). Ela
+    // era gravada com o corpo no ingest e ninguém a mexia no apagamento — então
+    // o texto saía da bolha e continuava na lista e na busca. Mascarar só o
+    // payload da thread deixaria esta porta aberta.
+    //
+    // Só a apagada pelo CONTATO entra: a do atendente segue legível à equipe
+    // (`textoDaApagadaApareceNaInbox`), e trocar a prévia dela seria regressão.
+    // E só quando ela é a ÚLTIMA (`last_message_at` <= `sent_at`): se já veio
+    // mensagem depois, a prévia é o assunto atual e não se toca.
+    if (linha.direction === "inbound") {
+      const { error: erroDaPrevia } = await admin
+        .from("conversations")
+        .update({ last_message_preview: PREVIA_DA_APAGADA_PELO_CONTATO })
+        .eq("id", linha.conversation_id)
+        .eq("organization_id", session.organization_id)
+        .lte("last_message_at", linha.sent_at);
+      if (erroDaPrevia) {
+        // Não derruba o webhook: a linha já está carimbada, e o provedor
+        // reentregaria o evento inteiro sem consertar a prévia.
+        logger.warn("[waha] a prévia da conversa não acompanhou o apagamento", {
+          request_id: requestId,
+          conversation_id: linha.conversation_id,
+          error: erroDaPrevia.message,
+        });
+      }
+    }
   }
 }
 

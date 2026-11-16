@@ -17,6 +17,11 @@ import { requireSupportWrite } from "@/lib/impersonate/support";
  * `imagem_url` e `ativo` ficam de fora de propósito — quem escreveu a descrição
  * pela tela não pode perdê-la porque alguém reimportou a lista de preços.
  *
+ * A descrição que a planilha TRAZ (uma coluna de descrição ao lado da de nome,
+ * ver `lerPlanilha`) entra num passo à parte, depois do upsert, e só onde a
+ * célula tem texto: planilha sem a coluna, ou com a célula vazia, não apaga o
+ * que a tela escreveu.
+ *
  * ─── A foto por URL (#3587) segue a mesma regra, e por isso é uma coluna ────
  *
  * A planilha pode trazer a coluna de foto, com um link ou até 5 separados por
@@ -36,7 +41,8 @@ import { randomUUID } from "node:crypto";
 import { type NextRequest } from "next/server";
 
 import { audit } from "@/lib/audit";
-import { fail, ok } from "@/lib/api/wrappers";
+import { comIdDaRequisicao, fail, ok } from "@/lib/api/wrappers";
+import { lerCorpoComTeto } from "@/lib/api/corpo-com-teto";
 import { requireRole } from "@/lib/auth/require-role";
 import { moedaDaOrganizacao } from "@/lib/catalogo/moeda-da-org";
 import { chaveDoCodigo, lerPlanilha, type ErroDaLinha } from "@/lib/catalogo/planilha";
@@ -44,6 +50,7 @@ import { guardarFotosPorUrl } from "@/lib/catalogo/fotos-por-url";
 import { apagarDoBucket } from "@/lib/catalogo/fotos-no-bucket";
 import { traduzir } from "@/lib/i18n/dicionario";
 import { CSV_MAX_BYTES, CSV_MAX_DATA_ROWS, decodificarCsv } from "@/lib/contacts/csv";
+import { capacidadesDaOrganizacao } from "@/lib/organizacao/capacidades";
 import { COLUNAS_DO_PRODUTO } from "@/lib/schemas/produtos";
 import { createClient } from "@/lib/supabase/server";
 
@@ -67,6 +74,8 @@ interface ResumoDaImportacao {
   total_linhas: number;
   criados: number;
   atualizados: number;
+  /** Quantos produtos tiveram a descrição escrita pela planilha. */
+  descricoes: number;
   erros: ErroDaLinha[];
   colunas_ignoradas: string[];
 }
@@ -82,9 +91,17 @@ export async function POST(req: NextRequest): Promise<Response> {
   const orgId = authz.org.orgId;
   const t = (texto: string) => traduzir(texto, authz.user.idioma);
 
+  // 64 KB de folga para o envelope multipart; o tamanho do CSV é conferido abaixo.
+  const corpo = await lerCorpoComTeto(req, CSV_MAX_BYTES + 64 * 1024, {
+    requestId,
+    idioma: authz.user.idioma,
+    acimaDoTeto: t("Arquivo maior que ") + `${Math.floor(CSV_MAX_BYTES / 1024 / 1024)}MB.`,
+  });
+  if (!corpo.ok) return corpo.response;
+
   let arquivo: File;
   try {
-    const form = await req.formData();
+    const form = await corpo.corpo.formData();
     const f = form.get("file");
     if (!(f instanceof File)) throw new Error("sem arquivo");
     arquivo = f;
@@ -121,7 +138,10 @@ export async function POST(req: NextRequest): Promise<Response> {
   if ("erro" in decodificado) {
     return fail("validation_failed", t(decodificado.erro), 422, { requestId });
   }
-  const lido = lerPlanilha(decodificado.texto, t);
+  const supabase = await createClient();
+  const lido = lerPlanilha(decodificado.texto, t, {
+    capacidade: (await capacidadesDaOrganizacao(supabase, orgId)).includes("capacidade_do_produto"),
+  });
   // Problema do ARQUIVO (falta a coluna de preço) é 422 com a frase inteira —
   // e não um relatório com 300 erros idênticos.
   if ("erro" in lido) return fail("validation_failed", lido.erro, 422, { requestId });
@@ -141,14 +161,13 @@ export async function POST(req: NextRequest): Promise<Response> {
         total_linhas: totalLinhas,
         criados: 0,
         atualizados: 0,
+        descricoes: 0,
         erros: lido.erros,
         colunas_ignoradas: lido.colunasIgnoradas,
       } satisfies ResumoDaImportacao,
       { requestId },
     );
   }
-
-  const supabase = await createClient();
 
   // Os códigos já cadastrados na organização servem a duas coisas. Quem já
   // existia com o código IGUAL é atualizado, para o resumo dizer "3 novos, 12
@@ -242,6 +261,7 @@ export async function POST(req: NextRequest): Promise<Response> {
     custo_cents: p.custo_cents,
     marca: p.marca ?? null,
     categoria: p.categoria ?? null,
+    ...(p.capacidade !== undefined ? { capacidade: p.capacidade } : {}),
     controla_estoque: p.controla_estoque,
     quantidade: p.quantidade,
     origem: "planilha",
@@ -352,8 +372,25 @@ export async function POST(req: NextRequest): Promise<Response> {
     await apagarDoBucket(orgId, id, antigas, requestId);
   }
 
+  // A descrição, num passo À PARTE e só onde a célula trouxe texto (ver o topo
+  // do arquivo): nunca no upsert, que a apagaria de quem reimporta sem ela. Só
+  // de quem REALMENTE entrou — e a organização vai junto, como no resto.
+  let descricoes = 0;
+  for (const p of preparadas) {
+    if (!p.descricao || !gravadosPorCodigo.has(p.codigo)) continue;
+    const { error } = await supabase
+      .from("catalog_products")
+      .update({ descricao: p.descricao })
+      .eq("organization_id", orgId)
+      .eq("codigo", p.codigo);
+    if (error) erros.push({ linha: p.linha, motivo: `"${p.nome}": ${error.message}` });
+    else descricoes += 1;
+  }
+
   const existentes = paraGravar.filter((p) => antigos.has(p.codigo));
-  const atualizados = existentes.length;
+  // Linha recusada pelo banco não conta como atualizada nem desconta um novo
+  // que entrou. O mesmo conjunto já governa a descrição e a troca das fotos.
+  const atualizados = existentes.filter((p) => gravadosPorCodigo.has(p.codigo)).length;
   const criados = Math.max(0, gravados - atualizados);
 
   await audit({
@@ -368,6 +405,7 @@ export async function POST(req: NextRequest): Promise<Response> {
       total_linhas: totalLinhas,
       criados,
       atualizados,
+      descricoes,
       erros: erros.length,
     },
   });
@@ -377,6 +415,7 @@ export async function POST(req: NextRequest): Promise<Response> {
       total_linhas: totalLinhas,
       criados,
       atualizados,
+      descricoes,
       erros,
       colunas_ignoradas: lido.colunasIgnoradas,
     } satisfies ResumoDaImportacao,
@@ -386,6 +425,9 @@ export async function POST(req: NextRequest): Promise<Response> {
 
 /**
  * GET devolve o modelo de planilha, para a pessoa não ter de adivinhar as colunas.
+ *
+ * A coluna `descricao` vem ao lado da de nome, com um exemplo na primeira linha:
+ * é ela que diz ao atendente de IA o que é o produto.
  *
  * A coluna `foto` vem no cabeçalho e VAZIA nas duas linhas: o modelo tem de
  * importar limpo como vem, que é o primeiro gesto de quem testa a importação.
@@ -399,16 +441,16 @@ export async function GET(): Promise<Response> {
   if (!authz.ok) return authz.response;
 
   const modelo = [
-    "codigo,nome,marca,categoria,preco,custo,estoque,foto",
-    "IP15-128,iPhone 15 128GB,Apple,Celular,5499.00,4100.00,3,",
-    "PERF-212,212 VIP Men 100ml,Carolina Herrera,Perfume,449.90,280.00,7,",
+    "codigo,nome,marca,categoria,preco,custo,estoque,descricao,foto",
+    'IP15-128,iPhone 15 128GB,Apple,Celular,5499.00,4100.00,3,"Tela de 6,1 polegadas, 128 GB",',
+    "PERF-212,212 VIP Men 100ml,Carolina Herrera,Perfume,449.90,280.00,7,,",
   ].join("\n");
 
-  return new Response(`﻿${modelo}\n`, {
+  return comIdDaRequisicao(new Response(`﻿${modelo}\n`, {
     headers: {
       "content-type": "text/csv; charset=utf-8",
       "content-disposition": 'attachment; filename="modelo-catalogo.csv"',
       "x-request-id": requestId,
     },
-  });
+  }), requestId);
 }

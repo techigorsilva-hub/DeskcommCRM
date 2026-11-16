@@ -38,7 +38,7 @@ import { ApiError } from "@/lib/api/types";
 import { SITUACOES_DO_AGENDAMENTO } from "@/lib/agenda/tipos";
 import { contatoDoNegocio } from "@/lib/operacao/modelos-de-mensagem";
 import type { McpContext, McpToolDefinition } from "@/lib/mcp/types";
-import { resolveUserNames } from "./_users";
+import { nomesDosAtendentesCom } from "@/lib/users/nome-do-atendente";
 
 /** Teto do horizonte pedido — espelha o da rota, e o excesso é erro de chamada. */
 const DIAS_PADRAO = 14;
@@ -136,6 +136,13 @@ export const crmListEventTypes: McpToolDefinition<typeof tiposShape> = {
         // Traduzido: `in_person` é vocabulário de banco e o modelo repassa o que
         // recebe. `rotuloDoLocal` é o MESMO tradutor que a tela usa.
         onde: rotuloDoLocal(t.localKind, t.localDetalhes) ?? null,
+        // O preço que a RECEPÇÃO cobra por este tipo, em CENTAVOS e cru: é a
+        // MESMA coluna (`calendar_event_types.default_price_cents`) que a
+        // comanda lê para sugerir o valor. Formatar em reais aqui faria o
+        // modelo repassar o texto formatado e errar a conta em qualquer
+        // reajuste; `null` é "a clínica não definiu preço", e zero seria um
+        // preço — grátis — que ninguém cadastrou.
+        preco_padrao_cents: t.precoPadraoCents ?? null,
         precisa_confirmacao: t.precisaConfirmacao,
         ...(t.servico ? { servico: t.servico } : {}),
       })),
@@ -546,12 +553,13 @@ export const crmListAppointments: McpToolDefinition<typeof listarShape> = {
     }
 
     // O NOME DO RESPONSÁVEL segue a mesma regra de exposição de #1528: sai pelo
-    // helper (`lib/mcp/tools/_users.ts`), que devolve SÓ o `full_name` — nunca
+    // helper (`lib/users/nome-do-atendente.ts`), que devolve SÓ o `full_name` — nunca
     // e-mail, telefone ou o `user_metadata` inteiro — e é não-crítico: falha de
     // lookup devolve `null`, não derruba a leitura. Montar nome à mão aqui seria
     // uma segunda fonte de verdade sobre quem é uma pessoa.
-    const nomes = await resolveUserNames(
+    const nomes = await nomesDosAtendentesCom(
       ctx.supabase,
+      ctx.organizationId,
       r.agendamentos.map((a) => a.donoId),
     );
 
@@ -733,7 +741,7 @@ export const crmBookAppointment: McpToolDefinition<typeof marcarShape> = {
     "visita, reunião. Use quando o cliente ESCOLHEU um horário e vai comparecer: isto reserva o " +
     "tempo de uma pessoa da equipe, e o cliente conta com ele. No atendimento atual, marcar Google Meet também agenda a entrega do link nesta conversa quando ficar pronto. " +
     "NÃO use para 'voltar a falar com o cliente depois' — isso é retorno, e a ferramenta é " +
-    "`crm_schedule_followup`. A diferença: aqui as DUAS partes combinaram e alguém vai esperar; " +
+    "a de agendar retorno. A diferença: aqui as DUAS partes combinaram e alguém vai esperar; " +
     "lá é decisão interna nossa e o cliente não sabe de nada. " +
     "⚠️ NÃO é para REMARCAR: se a cliente JÁ tem um compromisso marcado e pede outro dia ou " +
     "hora, isso é `crm_reschedule_appointment` — aqui nasce um SEGUNDO compromisso e o antigo " +
@@ -942,7 +950,7 @@ export const crmFindAndBookAppointment: McpToolDefinition<typeof consultarEMarca
     "fica no lugar, com dois avisos contraditórios. Localize o id do compromisso com " +
     "`crm_list_appointments` (sem `dia`) antes de mover. " +
     "Não use quando o cliente ainda não escolheu hora (aí é `crm_find_free_slots`) nem para " +
-    "voltar a falar com ele depois (é `crm_schedule_followup`). " +
+    "voltar a falar com ele depois (é retorno, outra ferramenta). " +
     "Se o horário NÃO estiver livre, NADA é marcado: a resposta traz `marcado: false` e a lista " +
     "`horarios` daquele dia — ofereça uma dessas opções ao cliente, não peça outro dia sem " +
     "mostrar o que existe. " +

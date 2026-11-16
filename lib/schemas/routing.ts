@@ -296,6 +296,29 @@ export type AvailabilityPatch = z.infer<typeof availabilityPatchSchema>;
 export const SETOR_NOME_MAX = 60;
 export const SETOR_DESCRICAO_MAX = 280;
 
+/**
+ * A cor de identificação da FILA (#3876 F3, migration 9084): `#rrggbb` ou `null`.
+ *
+ * ─── Por que uma regex própria, e não `ehHexValido` ────────────────────────
+ *
+ * `ehHexValido` (`lib/branding/rampa.ts`) aceita `#abc` e também a forma SEM
+ * cerquilha — três grafias que o CHECK da coluna recusa. Usá-la aqui daria duas
+ * réguas para a mesma coluna: o Zod aceitaria, o banco recusaria, e o 500
+ * apareceria primeiro em produção. A régua tem de ser a MESMA das duas pontas, e
+ * `tests/invariants/setores-cor-da-fila.test.ts` compara as duas grafia por
+ * grafia — a discordância reprova citando o texto recusado.
+ *
+ * A PERTINÊNCIA À PALETA não se valida, igual à cor de etiqueta (#1271): quem
+ * oferece os tons é a tela (`PALETA_DE_ETIQUETAS`), e o banco não precisa saber
+ * o que é decoração de tela. O que o banco precisa garantir é a FORMA.
+ */
+export const COR_DA_FILA = /^#[0-9a-fA-F]{6}$/;
+
+export const corDaFilaSchema = z
+  .string()
+  .regex(COR_DA_FILA, "A cor da fila precisa ser um hexadecimal de seis dígitos, como #1a2b3c.")
+  .nullable();
+
 export const sectorCreateSchema = z
   .object({
     name: z.string().trim().min(1, "Dê um nome ao setor.").max(SETOR_NOME_MAX),
@@ -326,11 +349,16 @@ export const sectorPatchSchema = z
       .transform((v) => (v ? v : null)),
     /** Horário da fila (migration 9062): casa com `isWithinSchedule`. */
     schedule: availabilityScheduleSchema,
+    /**
+     * Cor da fila (migration 9084). `null` = sem cor, o visual de antes desta
+     * fatia — apagar a cor é intenção explícita, não campo ausente.
+     */
+    color: corDaFilaSchema,
   })
   .partial()
   .strict()
   .refine((v) => Object.keys(v).length > 0, {
-    message: "Informe ao menos um campo (name, description ou schedule).",
+    message: "Informe ao menos um campo (name, description, schedule ou color).",
   });
 export type SectorPatch = z.infer<typeof sectorPatchSchema>;
 
@@ -366,10 +394,32 @@ export type ConversationSector = z.infer<typeof conversationSectorSchema>;
  * número fica sem regra própria (herda a organização). `null` explícito é
  * diferente de omitir na chamada da RPC — a tela manda sempre o que quer gravar.
  */
+/**
+ * Faixa do prazo máximo de "esperar a IA qualificar antes de distribuir"
+ * (#3966, doc 311): 15 minutos a 7 dias — a mesma faixa que o #4064 de
+ * @webtecnica propôs. O banco repete a faixa no CHECK de
+ * `channel_routing_policies.ai_wait_minutes` e em `fn_set_channel_ai_wait`.
+ */
+export const ESPERA_PELA_IA_MIN_MINUTOS = 15;
+export const ESPERA_PELA_IA_MAX_MINUTOS = 10_080;
+
 export const channelRoutingPatchSchema = z.object({
   channel_session_id: z.string().uuid(),
   user_ids: z.array(z.string().uuid()).max(1000),
   reset: z.boolean().default(false),
   distribution_mode: z.enum(ROUTING_MODES).nullable().optional(),
   default_assignee_user_id: z.string().uuid().nullable().optional(),
+  /**
+   * "Esperar a IA qualificar antes de distribuir" (#3966) — o prazo máximo da
+   * espera, em minutos. Um campo só de propósito: não existe "esperar sem
+   * prazo". `null` desliga (o padrão de fábrica); OMITIDO preserva o que o
+   * número já tinha, para um cliente antigo da API não desligar por omissão.
+   */
+  ai_wait_minutes: z
+    .number()
+    .int()
+    .min(ESPERA_PELA_IA_MIN_MINUTOS)
+    .max(ESPERA_PELA_IA_MAX_MINUTOS)
+    .nullable()
+    .optional(),
 }).strict();
