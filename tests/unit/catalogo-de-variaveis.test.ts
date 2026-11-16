@@ -3,105 +3,159 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { renderizar, VARIAVEIS_DA_CAMPANHA } from "@/lib/campanhas/renderizador";
-import { interpolateTemplate } from "@/lib/inbox/template-vars";
+import { renderTemplate } from "@/lib/automation/template";
 import {
-  DIVERGENCIAS,
-  eCuringa,
-  exclusivasDe,
-  normalizarToken,
+  RAIZES_DE_CAMPO as RAIZES_DA_CAMPANHA,
+  renderizar,
+  VARIAVEIS_DA_CAMPANHA,
+} from "@/lib/campanhas/renderizador";
+import { valorDaFonte, type FonteDeVariavel } from "@/lib/channels/meta/variaveis-do-fluxo";
+import { DICIONARIO } from "@/lib/i18n/dicionario";
+import { interpolateTemplate } from "@/lib/inbox/template-vars";
+import { substituirVariaveis } from "@/lib/propostas/documento/variaveis";
+import {
+  ARQUIVOS_DOS_RESOLVEDORES,
+  DICA_DO_CURINGA,
+  GRUPOS_DE_VARIAVEL,
+  LACUNAS_CONHECIDAS,
   RAIZES_DE_CAMPO,
   RESOLVEDORES,
-  RESOLVEDORES_NAO_COBERTOS,
+  ROTULO_DO_GRUPO,
+  SENTIDOS_DIVERGENTES,
   SUFIXO_DE_CURINGA,
   VARIAVEIS_DO_CATALOGO,
+  VOCABULARIOS_ABERTOS,
+  eCuringa,
+  exclusivasDe,
+  nomesDoCatalogo,
+  normalizarToken,
   variavelDoCatalogo,
   variaveisDe,
-  type Resolvedor,
-} from "@/lib/templates/catalogo-de-variaveis";
+} from "@/lib/variaveis/catalogo";
 
 /**
- * O CATÁLOGO SÓ VALE SE DESCREVER O QUE EXISTE — e é isso que este arquivo prova.
+ * O CATÁLOGO SÓ VALE SE DESCREVER O QUE EXISTE — e é isto que este arquivo prova.
  *
  * A tentação de um catálogo único é escrever o vocabulário que se GOSTARIA de
- * ter. Aí ele fica bonito e mentiroso: a tela oferece `{{saudacao}}` no Inbox,
- * onde o token sai literal na mensagem do cliente. Por isso cada linha do
- * catálogo é conferida contra os DOIS resolvedores de verdade — o Inbox
- * (`interpolateTemplate`, o mais pobre) e a campanha (`renderizar`, o mais rico),
- * escolhidos por cobrirem os extremos:
+ * ter. Aí ele fica bonito e mentiroso: a tela oferece `{{saudacao}}` numa
+ * automação, onde o token sai como string VAZIA na mensagem do cliente. Por isso
+ * cada fonte de verdade do produto é lida e conferida contra o catálogo:
  *
- *   - o valor sai igual onde os dois conhecem a variável;
- *   - onde um não conhece, o token continua LITERAL lá, e o catálogo diz isso;
- *   - com o dado ausente, cada um faz o que já fazia (Inbox deixa literal,
- *     campanha marca `faltando`) — nada aqui "melhora" esse comportamento.
+ *   - Inbox            · `lib/inbox/template-vars.ts`
+ *   - Campanha         · `lib/campanhas/renderizador.ts`
+ *   - Automação        · `lib/automation/template.ts`
+ *   - Fluxo (Meta)     · `lib/channels/meta/variaveis-do-fluxo.ts`
+ *   - Seletor da tela  · `components/variaveis/SeletorDeVariavel.tsx`
  *
- * A lista de vocabulário não é redigitada: sai do próprio resolvedor (o array
- * exportado da campanha, o literal `VARIAVEIS_DE_NOME` do Inbox). Assim, quando
- * alguém acrescentar uma variável lá e esquecer aqui, o teste reprova onde a
- * pessoa está editando.
+ * ATÉ #3687 a conferência era de LISTA: cada tela tinha a sua (`VARIAVEIS_DE_NOME`
+ * no Inbox, `VARIAVEIS_DA_CAMPANHA` na campanha, `TEMPLATE_VARS` no seletor) e
+ * este arquivo comparava lista com lista. As listas não existem mais: as quatro
+ * telas passaram a chamar o MESMO resolvedor (`lib/variaveis/resolvedor.ts`) com
+ * a MESMA fonte do catálogo. Então a conferência passou a ser de COMPORTAMENTO —
+ * para cada entrada do catálogo, a tela resolve (ou não) exatamente o que o
+ * catálogo promete. É mais forte que a comparação de listas: pega o item que
+ * está catalogado e morreu no motor.
+ *
+ * Proposta e os campos criados pela organização não têm lista fechada: ficam
+ * declarados em `VOCABULARIOS_ABERTOS`, e o teste prova a declaração em vez de
+ * fingir paridade.
  */
 
 const RAIZ = join(__dirname, "..", "..");
-const CATALOGO = join(RAIZ, "lib", "templates", "catalogo-de-variaveis.ts");
-const INBOX = join(RAIZ, "lib", "inbox", "template-vars.ts");
-const CAMPANHA = join(RAIZ, "lib", "campanhas", "renderizador.ts");
+const CATALOGO = join(RAIZ, "lib", "variaveis", "catalogo.ts");
+const INBOX = "lib/inbox/template-vars.ts";
+const CAMPANHA = "lib/campanhas/renderizador.ts";
+const AUTOMACAO = "lib/automation/template.ts";
+const FLUXO = "lib/channels/meta/variaveis-do-fluxo.ts";
+const SELETOR = "app/app/webhooks/_components/ActionConfigForm.tsx";
+const PROPOSTA = "lib/propostas/documento/variaveis.ts";
 
-/**
- * O vocabulário de um resolvedor, lido do próprio fonte — a lista que precisa
- * espelhar o catálogo é a que está no código, não uma segunda cópia escrita
- * aqui. Se o array mudar de nome, isto reprova com a mensagem do `throw` em vez
- * de passar em silêncio com uma lista vazia.
- */
-function listaDoFonte(fonte: string, nome: string): string[] {
-  const bloco = new RegExp(`${nome}\\s*=\\s*\\[([^\\]]*)\\]`).exec(fonte);
-  if (!bloco) throw new Error(`${nome} não encontrada no fonte`);
-  return [...(bloco[1] ?? "").matchAll(/"([^"]+)"/g)].map((m) => m[1] as string);
+const fonte = (arquivo: string): string => readFileSync(join(RAIZ, arquivo), "utf8");
+
+/** As CHAVES de um objeto literal do fonte (`const ALIASES = { nome: "..." }`). */
+function chavesDoObjeto(texto: string, nome: string): string[] {
+  const bloco = new RegExp(`${nome}(?:\\s*:[^=]+)?\\s*=\\s*\\{([\\s\\S]*?)\\n\\};`).exec(texto);
+  if (!bloco) throw new Error(`${nome} não encontrado no fonte`);
+  const chaves = [...(bloco[1] ?? "").matchAll(/^\s*([a-zA-Z_][a-zA-Z0-9_]*):\s*"/gm)].map(
+    (m) => m[1] as string,
+  );
+  if (chaves.length === 0) throw new Error(`${nome} está vazio no fonte`);
+  return chaves;
 }
 
-/** O Inbox não exporta a lista (é detalhe interno), mas é ELA que o catálogo espelha. */
-const VARIAVEIS_DO_INBOX = listaDoFonte(readFileSync(INBOX, "utf8"), "const VARIAVEIS_DE_NOME");
+/** Os aliases de `renderTemplate` — o vocabulário que a automação conhece por nome. */
+const ALIASES_DA_AUTOMACAO = chavesDoObjeto(fonte(AUTOMACAO), "const ALIASES");
 
-/** O da campanha: as chaves fechadas + as duas raízes de campo, que são caminho. */
-const VARIAVEIS_DA_CAMPANHA_DO_FONTE = listaDoFonte(
-  readFileSync(CAMPANHA, "utf8"),
-  "VARIAVEIS_DA_CAMPANHA",
-);
+/** As origens que o schema do modelo aprovado aceita (`fonteDeVariavelSchema`). */
+const ORIGENS_DO_FLUXO = [
+  ...fonte(FLUXO).matchAll(/kind:\s*z\.literal\("([a-z_]+)"\)/g),
+].map((m) => m[1] as string);
 
-const VARIAVEIS_DA_CAMPANHA_NO_CATALOGO = [
-  ...VARIAVEIS_DA_CAMPANHA_DO_FONTE,
-  ...RAIZES_DE_CAMPO.map((raiz) => `${raiz}${SUFIXO_DE_CURINGA}`),
+/**
+ * As telas que oferecem variável (#3687). Todas importam o MESMO seletor e dizem
+ * qual é a fonte — nenhuma mantém lista própria de vocabulário.
+ */
+const TELAS_COM_SELETOR: { arquivo: string; fonte: string }[] = [
+  { arquivo: SELETOR, fonte: "automacao" },
+  { arquivo: "app/app/ai/followups/[id]/_components/forms/ActionForm.tsx", fonte: "automacao" },
+  { arquivo: "app/app/campaigns/new/_client.tsx", fonte: "campanha" },
+  { arquivo: "app/app/campaigns/[id]/edit/_client.tsx", fonte: "campanha" },
+  { arquivo: "app/app/templates/_components/TemplateFormDialog.tsx", fonte: "inbox" },
 ];
 
 const CONTATO = { name: "Ana Souza" };
 const VALORES = {
   nome: "Ana Souza",
-  lead: { gancho: "vi que vocês vendem bolo de casamento" },
-  contato: { link_previa: "https://loja.exemplo/previa/ana" },
+  lead: { gancho: "do bolo", title: "Maria" },
+  contato: { gancho: "ctt" },
 };
 /** 15:00Z = meio-dia em São Paulo — o primeiro segundo de "Boa tarde". */
 const QUANDO = { agora: new Date("2026-10-29T15:00:00Z"), fuso: "America/Sao_Paulo" };
+/** O instante do Inbox é o do compositor: a hora do clique, no fuso de quem atende. */
+const AGORA_INBOX = { instante: QUANDO.agora, fuso: QUANDO.fuso };
+/** O contexto da automação é `{ contact, lead }` — LINHAS inteiras. */
+const CONTEXTO = {
+  contact: {
+    name: "Ana Souza",
+    phone_number: "+5511999998888",
+    email: "ana@exemplo.com",
+    custom_fields: { gancho: "cf-contato" },
+  },
+  lead: { title: "Negocio X", custom_fields: { gancho: "cf-negocio" } },
+};
 
 /**
- * Caso a caso: o token como o operador escreve, e o que cada resolvedor devolve
- * com o dado PRESENTE. O literal esperado é o próprio token, escrito por extenso
- * — quem lê o teste vê a divergência sem rodar nada.
+ * Um token de exemplo por linha do catálogo. A igualdade de chaves (teste da
+ * forma) obriga quem acrescentar uma linha a escolher um exemplo aqui — sem
+ * isso, o `lacunas` e o `sentido` abaixo passariam a conferir menos sem avisar.
  */
-const CASOS: { token: string; inbox: string; campanha: string }[] = [
-  { token: "{{nome}}", inbox: "Ana Souza", campanha: "Ana Souza" },
-  { token: "{{primeiro_nome}}", inbox: "Ana", campanha: "Ana" },
-  { token: "{{saudacao}}", inbox: "{{saudacao}}", campanha: "Boa tarde" },
-  { token: "{{lead.gancho}}", inbox: "{{lead.gancho}}", campanha: VALORES.lead.gancho },
-  {
-    token: "{{contato.link_previa}}",
-    inbox: "{{contato.link_previa}}",
-    campanha: "https://loja.exemplo/previa/ana",
-  },
-];
+const TOKEN_DE_EXEMPLO: Record<string, string> = {
+  nome: "{{nome}}",
+  primeiro_nome: "{{primeiro_nome}}",
+  saudacao: "{{saudacao}}",
+  telefone: "{{telefone}}",
+  email: "{{email}}",
+  "lead.*": "{{lead.gancho}}",
+  "contato.*": "{{contato.gancho}}",
+  "contact.*": "{{contact.phone_number}}",
+};
 
-describe("o catálogo descreve o que cada resolvedor faz, variável por variável", () => {
-  for (const caso of CASOS) {
+describe("o catálogo descreve o que o Inbox e a campanha fazem, variável por variável", () => {
+  const casos: { token: string; inbox: string; campanha: string }[] = [
+    { token: "{{nome}}", inbox: "Ana Souza", campanha: "Ana Souza" },
+    { token: "{{primeiro_nome}}", inbox: "Ana", campanha: "Ana" },
+    { token: "{{saudacao}}", inbox: "Boa tarde", campanha: "Boa tarde" },
+    { token: "{{lead.gancho}}", inbox: "{{lead.gancho}}", campanha: "do bolo" },
+    {
+      token: "{{contato.gancho}}",
+      inbox: "{{contato.gancho}}",
+      campanha: "ctt",
+    },
+  ];
+
+  for (const caso of casos) {
     it(`${caso.token}: Inbox devolve "${caso.inbox}", campanha devolve "${caso.campanha}"`, () => {
-      const inbox = interpolateTemplate(caso.token, CONTATO);
+      const inbox = interpolateTemplate(caso.token, CONTATO, AGORA_INBOX);
       const campanha = renderizar(caso.token, VALORES, QUANDO);
 
       expect(inbox).toBe(caso.inbox);
@@ -110,184 +164,347 @@ describe("o catálogo descreve o que cada resolvedor faz, variável por variáve
       expect(campanha.desconhecidas).toEqual([]);
 
       // A linha do catálogo é o que os dois ACABARAM de fazer — não o contrário.
-      // Com dado presente, "resolveu" é a mesma coisa que "tem regra": só a
-      // saudação sem instante separa as duas (e tem teste próprio abaixo).
-      const resolveram = RESOLVEDORES.filter((r) =>
+      const resolveram = (["inbox", "campanha"] as const).filter((r) =>
         r === "inbox" ? inbox !== caso.token : campanha.texto !== caso.token,
       );
-      const catalogo = variavelDoCatalogo(caso.token);
-      expect(catalogo, `${caso.token} não está no catálogo`).not.toBeNull();
-      expect([...catalogo!.disponivelEm].sort()).toEqual([...resolveram].sort());
+      const entrada = variavelDoCatalogo(caso.token);
+      expect(entrada, `${caso.token} não está no catálogo`).not.toBeNull();
+      for (const r of resolveram) {
+        expect(entrada!.disponivelEm, `${caso.token} resolve em ${r} e o catálogo não diz`).toContain(
+          r,
+        );
+      }
     });
   }
 });
 
-describe("o vocabulário do catálogo é exatamente o dos dois resolvedores", () => {
-  it("Inbox: nome e primeiro_nome, nada mais", () => {
-    expect([...variaveisDe("inbox")].sort()).toEqual([...VARIAVEIS_DO_INBOX].sort());
-    expect([...variaveisDe("inbox")].sort()).toEqual(["nome", "primeiro_nome"]);
-  });
+describe("o catálogo descreve o que a automação faz, variável por variável", () => {
+  const casos: { token: string; esperado: string }[] = [
+    { token: "{{nome}}", esperado: "Ana Souza" },
+    { token: "{{primeiro_nome}}", esperado: "Ana" },
+    // O telefone é o valor do contato — nunca um literal reescrito aqui (a
+    // saída passa por mascaramento de privacidade no ambiente de teste).
+    { token: "{{telefone}}", esperado: CONTEXTO.contact.phone_number },
+    { token: "{{email}}", esperado: "ana@exemplo.com" },
+    // Sem instante do envio não há saudação a dar: o token fica como foi escrito
+    // (era a lacuna mais cara do produto — sumia como vazio, sem aviso).
+    { token: "{{saudacao}}", esperado: "{{saudacao}}" },
+    // `{{lead.title}}` aqui é a COLUNA do card, não campo personalizado.
+    { token: "{{lead.title}}", esperado: "Negocio X" },
+    { token: "{{lead.custom_fields.gancho}}", esperado: "cf-negocio" },
+    { token: "{{gancho}}", esperado: "cf-negocio" },
+    { token: "{{contact.custom_fields.gancho}}", esperado: "cf-contato" },
+  ];
 
-  it("campanha: as três chaves exportadas mais as duas raízes de campo", () => {
-    // O que o módulo exporta e o que está escrito no fonte são a mesma lista —
-    // se divergirem, quem lê o código e quem importa estão vendo coisas diferentes.
-    expect([...VARIAVEIS_DA_CAMPANHA]).toEqual(VARIAVEIS_DA_CAMPANHA_DO_FONTE);
-    expect([...variaveisDe("campanha")].sort()).toEqual(
-      [...VARIAVEIS_DA_CAMPANHA_NO_CATALOGO].sort(),
-    );
-  });
-
-  it("as raízes do catálogo são as mesmas que o renderizador da campanha aceita", () => {
-    expect(RAIZES_DE_CAMPO).toEqual(["lead", "contato"]);
-    // `{{lead}}` sem campo não é variável para ninguém: o renderizador exige o
-    // ponto, e o catálogo também — não inventa uma chave que ninguém resolve.
-    expect(renderizar("{{lead}}", VALORES, QUANDO).desconhecidas).toEqual(["lead"]);
-    expect(variavelDoCatalogo("{{lead}}")).toBeNull();
-  });
+  for (const caso of casos) {
+    it(`${caso.token}: renderTemplate devolve "${caso.esperado}"`, () => {
+      expect(renderTemplate(caso.token, CONTEXTO)).toBe(caso.esperado);
+    });
+  }
 });
 
-describe("a divergência entre os dois não fica escondida", () => {
-  it("as exclusivas do catálogo são as mesmas da tabela DIVERGENCIAS", () => {
-    const derivadas = RESOLVEDORES.flatMap((r: Resolvedor) =>
-      exclusivasDe(r).map((v) => `${v}@${r}`),
-    ).sort();
-    const escritas = DIVERGENCIAS.map((d) => `${d.variavel}@${d.existeEm}`).sort();
-    expect(escritas).toEqual(derivadas);
-  });
-
-  it("cada divergência existe em um lado e o outro deixa o token literal", () => {
-    const exemplo: Record<string, string> = {
-      saudacao: "{{saudacao}}",
-      "lead.*": "{{lead.gancho}}",
-      "contato.*": "{{contato.link_previa}}",
-    };
-
-    for (const d of DIVERGENCIAS) {
-      const entrada = variavelDoCatalogo(exemplo[d.variavel]!);
-      expect(entrada, `${d.variavel} sem linha no catálogo`).not.toBeNull();
-      expect(entrada!.disponivelEm).toContain(d.existeEm);
-      expect(entrada!.disponivelEm).not.toContain(d.faltaEm);
-      expect(d.efeito).not.toBe("");
-
-      // O lado pobre não conhece a chave: o literal sobrevive, como o `efeito` diz.
-      expect(interpolateTemplate(exemplo[d.variavel]!, CONTATO)).toBe(exemplo[d.variavel]);
+describe("toda variável que uma fonte conhece está no catálogo", () => {
+  it(`Inbox (${INBOX}): resolve o catálogo inteiro de lá e nada além`, () => {
+    // Sem lista própria no fonte, a conferência é de COMPORTAMENTO: o que o
+    // catálogo dá ao Inbox resolve; o que ele NÃO dá continua literal, que é o
+    // que a resposta rápida faz com token de outra tela.
+    for (const nome of variaveisDe("inbox")) {
+      const token = TOKEN_DE_EXEMPLO[nome]!;
+      expect(
+        interpolateTemplate(token, CONTATO, AGORA_INBOX),
+        `${nome} está catalogada no Inbox (${INBOX}) e não resolve lá`,
+      ).not.toBe(token);
+    }
+    for (const v of VARIAVEIS_DO_CATALOGO.filter((v) => !v.disponivelEm.includes("inbox"))) {
+      const token = TOKEN_DE_EXEMPLO[v.nome]!;
+      expect(
+        interpolateTemplate(token, CONTATO, AGORA_INBOX),
+        `${v.nome} NÃO está catalogada no Inbox e mesmo assim resolve em ${INBOX}`,
+      ).toBe(token);
     }
   });
 
-  it("saudação existe só na campanha — e é a única diferença de chave fechada", () => {
-    expect(exclusivasDe("campanha").filter((v) => !eCuringa(v))).toEqual(["saudacao"]);
-    expect(exclusivasDe("inbox")).toEqual([]);
+  it(`campanha (${CAMPANHA}): resolve o catálogo inteiro de lá e nada além`, () => {
+    // As raízes de campo são as únicas com caminho aberto — e o catálogo as
+    // declara como curinga, não como chave fechada.
+    for (const raiz of RAIZES_DA_CAMPANHA) {
+      expect(RAIZES_DE_CAMPO as readonly string[]).toContain(raiz);
+    }
+    for (const nome of variaveisDe("campanha")) {
+      const token = TOKEN_DE_EXEMPLO[nome]!;
+      const r = renderizar(token, VALORES, QUANDO);
+      expect(r.desconhecidas, `${nome} está catalogada na campanha e saiu desconhecida`).toEqual([]);
+      expect(r.texto, `${nome} está catalogada na campanha (${CAMPANHA}) e não resolve`).not.toBe(
+        token,
+      );
+    }
+    const doCatalogo = new Set(variaveisDe("campanha"));
+    for (const v of VARIAVEIS_DO_CATALOGO.filter((v) => !v.disponivelEm.includes("campanha"))) {
+      expect(doCatalogo.has(v.nome), `${v.nome} sai da campanha e o catálogo diz que sim`).toBe(
+        false,
+      );
+      expect(renderizar(TOKEN_DE_EXEMPLO[v.nome]!, VALORES, QUANDO).desconhecidas.length).toBe(1);
+    }
+  });
+
+  it(`automação (${AUTOMACAO}): todo alias de renderTemplate`, () => {
+    expect(ALIASES_DA_AUTOMACAO.length).toBeGreaterThan(0);
+    for (const chave of ALIASES_DA_AUTOMACAO) {
+      const token = `{{${chave}}}`;
+      const entrada = variavelDoCatalogo(token);
+      expect(
+        entrada,
+        `${chave} resolve em ${AUTOMACAO} (ALIASES) e não está no catálogo`,
+      ).not.toBeNull();
+      expect(entrada!.disponivelEm, `${chave} existe em ${AUTOMACAO} e o catálogo não diz`).toContain(
+        "automacao",
+      );
+    }
+  });
+
+  it(`automação (${AUTOMACAO}): cada alias resolve de verdade, não só está escrito`, () => {
+    // A paridade é com o MOTOR, não com a constante: um alias acrescentado ao
+    // `ALIASES` sem caminho no contexto ficaria catalogado e morto.
+    const esperado: Record<string, string> = {
+      nome: "Ana Souza",
+      primeiro_nome: "Ana",
+      telefone: CONTEXTO.contact.phone_number,
+      email: "ana@exemplo.com",
+    };
+    for (const chave of ALIASES_DA_AUTOMACAO) {
+      const esperadoDaChave = esperado[chave];
+      expect(
+        esperadoDaChave,
+        `${chave} é alias novo em ${AUTOMACAO}: escolha o valor esperado neste teste`,
+      ).toBeDefined();
+      expect(renderTemplate(`{{${chave}}}`, CONTEXTO)).toBe(esperadoDaChave);
+    }
+  });
+
+  it(`fluxo (${FLUXO}): toda origem de fonteDeVariavelSchema`, () => {
+    // O fluxo fala posição (`{{1}}`), não nome: o mapeamento abaixo é a tradução
+    // de origem → token que o catálogo cataloga.
+    const tokenDaOrigem: Record<string, string> = {
+      contact_name: "{{nome}}",
+      contact_first_name: "{{primeiro_nome}}",
+      lead_custom: "{{lead.gancho}}",
+      // #3687 — a origem aditiva: qualquer nome do catálogo, resolvido pelo
+      // resolvedor único. O exemplo é a chave fechada que ela acrescenta.
+      variavel: "{{nome}}",
+    };
+    expect(ORIGENS_DO_FLUXO.length).toBeGreaterThan(0);
+    // Igualdade exata: origem nova no schema obriga revisar a tradução.
+    expect(Object.keys(tokenDaOrigem).sort()).toEqual([...new Set(ORIGENS_DO_FLUXO)].sort());
+
+    for (const origem of ORIGENS_DO_FLUXO) {
+      const token = tokenDaOrigem[origem]!;
+      const entrada = variavelDoCatalogo(token);
+      expect(
+        entrada,
+        `a origem "${origem}" de ${FLUXO} preenche ${token}, que não está no catálogo`,
+      ).not.toBeNull();
+      expect(
+        entrada!.disponivelEm,
+        `a origem "${origem}" de ${FLUXO} existe e o catálogo não lista fluxo em ${token}`,
+      ).toContain("fluxo");
+    }
+  });
+
+  it(`fluxo (${FLUXO}): cada origem resolve o valor que o catálogo promete`, () => {
+    const dados = { nomeDoContato: "Ana Souza", camposDoNegocio: { gancho: "do bolo" } };
+    const esperado: { fonte: FonteDeVariavel; valor: string | null }[] = [
+      { fonte: { kind: "contact_name" }, valor: "Ana Souza" },
+      { fonte: { kind: "contact_first_name" }, valor: "Ana" },
+      { fonte: { kind: "lead_custom", key: "gancho" }, valor: "do bolo" },
+      { fonte: { kind: "lead_custom", key: "naoexiste" }, valor: null },
+      // #3687 — a origem nova fala o vocabulário do catálogo, pelo resolvedor.
+      { fonte: { kind: "variavel", chave: "nome" }, valor: "Ana Souza" },
+      { fonte: { kind: "variavel", chave: "primeiro_nome" }, valor: "Ana" },
+      { fonte: { kind: "variavel", chave: "lead.gancho" }, valor: "do bolo" },
+      // `{{saudacao}}` não vale no fluxo (o fluxo não tem instante de envio
+      // quando monta a tela): sem valor, o passo é recusado com motivo.
+      { fonte: { kind: "variavel", chave: "saudacao" }, valor: null },
+    ];
+    for (const caso of esperado) expect(valorDaFonte(caso.fonte, dados)).toBe(caso.valor);
+  });
+
+  it("as telas usam o MESMO seletor, com a fonte certa — e nenhuma lista própria", () => {
+    // Antes de #3687 cada tela tinha a sua lista (três botões fixos na
+    // automação, `VARIAVEIS_DE_NOME` no Inbox, `VARIAVEIS_DA_CAMPANHA` na
+    // campanha). O que este teste impede é a lista VOLTAR: se alguém escrever
+    // um array de variáveis dentro de uma tela, ele reprova aqui.
+    for (const { arquivo, fonte: fonteDaTela } of TELAS_COM_SELETOR) {
+      const texto = fonte(arquivo);
+      expect(texto, `${arquivo} não importa o seletor único`).toMatch(
+        /from "@\/components\/variaveis\/(SeletorDeVariavel|CampoComVariaveis)"/,
+      );
+      if (!texto.includes("CampoComVariaveis")) {
+        expect(texto, `${arquivo} usa o seletor sem dizer a fonte`).toContain(
+          `fonte="${fonteDaTela}"`,
+        );
+      }
+      // Nenhuma lista de tokens escrita à mão na tela.
+      expect(
+        texto,
+        `${arquivo} voltou a manter uma lista própria de variáveis (TEMPLATE_VARS/VARIAVEIS_DE_* com ["..."])`,
+      ).not.toMatch(/const (TEMPLATE_VARS|VARIAVEIS_DE_[A-Z_]+)\s*=\s*\[/);
+    }
+  });
+
+  it("todo item que o seletor oferece vem do catálogo e resolve de verdade", () => {
+    // O seletor é TELA, não resolvedor: ele não pode oferecer mais que o motor.
+    for (const tela of TELAS_COM_SELETOR) {
+      for (const nome of variaveisDe(tela.fonte as Parameters<typeof variaveisDe>[0])) {
+        const token = TOKEN_DE_EXEMPLO[nome]!;
+        const resolvido =
+          tela.fonte === "campanha"
+            ? renderizar(token, VALORES, QUANDO).texto
+            : tela.fonte === "inbox"
+              ? interpolateTemplate(token, CONTATO, AGORA_INBOX)
+              : renderTemplate(token, CONTEXTO, undefined, AGORA_INBOX);
+        expect(
+          resolvido,
+          `o seletor de ${tela.arquivo} oferece ${nome} e o motor da tela não resolve`,
+        ).not.toBe(token);
+      }
+    }
   });
 });
 
-describe("dado ausente: o catálogo não promete texto que o resolvedor não dá", () => {
-  it("Inbox sem nome: nome e primeiro_nome continuam literais", () => {
-    expect(interpolateTemplate("Oi {{nome}}!", { name: null })).toBe("Oi {{nome}}!");
-    expect(interpolateTemplate("Oi {{primeiro_nome}}!", { name: null })).toBe(
-      "Oi {{primeiro_nome}}!",
-    );
-    expect(interpolateTemplate("Oi {{nome}}!", {})).toBe("Oi {{nome}}!");
-    expect(interpolateTemplate("Oi {{primeiro_nome}}!", { name: "   " })).toBe(
-      "Oi {{primeiro_nome}}!",
-    );
+describe("a divergência entre as fontes não fica escondida", () => {
+  it("as lacunas são EXATAMENTE as que o catálogo declara", () => {
+    const derivadas = VARIAVEIS_DO_CATALOGO.flatMap((v) =>
+      RESOLVEDORES.filter((r) => !v.disponivelEm.includes(r)).map((r) => `${v.nome}@${r}`),
+    ).sort();
+    const escritas = LACUNAS_CONHECIDAS.map((l) => `${l.variavel}@${l.fonte}`).sort();
+
+    // Igualdade, não `>=`: lacuno a mais é catálogo que mente sobre a fonte, e
+    // lacuno a menos é divergência que fica sem explicação para o operador.
+    expect(escritas).toEqual(derivadas);
   });
 
-  it("Inbox com nome vazio cai no display_name — é o que a origem do catálogo diz", () => {
-    expect(interpolateTemplate("Oi {{nome}}!", { name: null, displayName: "Ana Paula" })).toBe(
-      "Oi Ana Paula!",
+  it("cada lacuna nomeia o efeito no operador e a variável existe no catálogo", () => {
+    for (const lacuna of LACUNAS_CONHECIDAS) {
+      expect(variavelDoCatalogo(TOKEN_DE_EXEMPLO[lacuna.variavel] ?? ""), lacuna.variavel).not.toBeNull();
+      expect(lacuna.efeito.trim(), `${lacuna.variavel}@${lacuna.fonte} sem efeito escrito`).not.toBe(
+        "",
+      );
+    }
+  });
+
+  it("no Inbox, TODA lacuna de lá sai literal — o token chega ao cliente", () => {
+    const doInbox = LACUNAS_CONHECIDAS.filter((l) => l.fonte === "inbox");
+    expect(doInbox.map((l) => l.variavel).sort()).toEqual(
+      ["contact.*", "contato.*", "email", "lead.*", "telefone"].sort(),
+    );
+    for (const lacuna of doInbox) {
+      const token = TOKEN_DE_EXEMPLO[lacuna.variavel]!;
+      expect(interpolateTemplate(token, CONTATO, AGORA_INBOX)).toBe(token);
+    }
+  });
+
+  it("na automação, caminho de contato sai VAZIO e saudação resolve no envio", () => {
+    // `{{contato.gancho}}` (a sintaxe da campanha) não existe no contexto da
+    // automação: sai vazio, sem `desconhecidas` e sem aviso ao operador.
+    expect(renderTemplate("{{contato.gancho}}", CONTEXTO)).toBe("");
+    // #3687 — a saudação deixou de ser lacuna: sem instante o token fica como
+    // foi escrito (nunca vazio); com instante, sai a saudação da hora.
+    expect(
+      LACUNAS_CONHECIDAS.some((l) => l.variavel === "saudacao" && l.fonte === "automacao"),
+    ).toBe(false);
+    expect(renderTemplate("Bom dia, {{primeiro_nome}}! {{saudacao}}", CONTEXTO)).toBe(
+      "Bom dia, Ana! {{saudacao}}",
     );
     expect(
-      interpolateTemplate("Oi {{primeiro_nome}}!", { name: "", displayName: "Ana Paula" }),
-    ).toBe("Oi Ana!");
+      renderTemplate("Bom dia, {{primeiro_nome}}! {{saudacao}}", CONTEXTO, undefined, AGORA_INBOX),
+    ).toBe("Bom dia, Ana! Boa tarde");
   });
 
-  it("campanha sem nome: literal + falta, nunca 'Olá , tudo bem?'", () => {
-    const nome = renderizar("Oi {{nome}}!", { nome: null }, QUANDO);
-    expect(nome.texto).toBe("Oi {{nome}}!");
-    expect(nome.faltando).toEqual(["nome"]);
-
-    const primeiro = renderizar("Oi {{primeiro_nome}}!", { nome: "   " }, QUANDO);
-    expect(primeiro.texto).toBe("Oi {{primeiro_nome}}!");
-    expect(primeiro.faltando).toEqual(["primeiro_nome"]);
+  it("na campanha, token desconhecido fica literal E entra em `desconhecidas`", () => {
+    const r = renderizar("{{telefone}}", VALORES, QUANDO);
+    expect(r.texto).toBe("{{telefone}}");
+    expect(r.desconhecidas).toEqual(["telefone"]);
+    expect(r.faltando).toEqual([]);
   });
 
-  it("campanha sem mapa de negócio: lead.* falta, e não vira string vazia", () => {
-    const semLead = renderizar("{{lead.gancho}}", { nome: "Ana", lead: null }, QUANDO);
-    expect(semLead.texto).toBe("{{lead.gancho}}");
-    expect(semLead.faltando).toEqual(["lead.gancho"]);
-
-    const semMapa = renderizar("{{contato.link_previa}}", { nome: "Ana" }, QUANDO);
-    expect(semMapa.texto).toBe("{{contato.link_previa}}");
-    expect(semMapa.faltando).toEqual(["contato.link_previa"]);
+  it("os caminhos com MAIS DE UM sentido estão declarados em SENTIDOS_DIVERGENTES", () => {
+    const curingasComVariasFontes = VARIAVEIS_DO_CATALOGO.filter(
+      (v) => eCuringa(v.nome) && v.disponivelEm.length > 1,
+    ).map((v) => v.nome);
+    expect(SENTIDOS_DIVERGENTES.map((s) => s.variavel).sort()).toEqual(curingasComVariasFontes.sort());
   });
 
-  it("campanha com campo vazio, objeto ou raiz de protótipo: falta, não texto pela metade", () => {
-    const vazio = renderizar("{{lead.gancho}}", { nome: "Ana", lead: { gancho: "   " } }, QUANDO);
-    expect(vazio.faltando).toEqual(["lead.gancho"]);
+  it("`{{lead.title}}` é a divergência que mais engana: mesmo token, valores diferentes", () => {
+    const declarada = SENTIDOS_DIVERGENTES.find((s) => s.variavel === "lead.*");
+    expect(declarada, "lead.* tem mais de um sentido e não está declarado").toBeDefined();
+    expect(Object.keys(declarada!.sentidoPorFonte).sort()).toEqual(["automacao", "campanha", "fluxo"]);
 
-    const objeto = renderizar(
-      "{{lead.gancho}}",
-      { nome: "Ana", lead: { gancho: { a: 1 } } },
-      QUANDO,
-    );
-    expect(objeto.faltando).toEqual(["lead.gancho"]);
-
-    const proto = JSON.parse('{"__proto__":"x"}') as Record<string, unknown>;
-    const atravessado = renderizar("{{lead.__proto__}}", { nome: "Ana", lead: proto }, QUANDO);
-    expect(atravessado.texto).toBe("{{lead.__proto__}}");
-    expect(atravessado.faltando).toEqual(["lead.__proto__"]);
-  });
-
-  it("campanha com lista: vírgula, que é como a pessoa leria", () => {
-    const lista = renderizar(
-      "{{lead.servico}}",
-      { nome: "Ana", lead: { servico: ["bolo", "doces"] } },
-      QUANDO,
-    );
-    expect(lista.texto).toBe("bolo, doces");
-    expect(lista.faltando).toEqual([]);
-  });
-
-  it("a reserva é sintaxe do motor, não uma variável do catálogo", () => {
-    expect(variavelDoCatalogo('{{nome|"aluno"}}')?.nome).toBe("nome");
-    expect(interpolateTemplate('Oi {{nome|"aluno"}}!', { name: null })).toBe("Oi aluno!");
-    expect(renderizar('Oi {{primeiro_nome|"aluno"}}!', { nome: null }, QUANDO).texto).toBe(
-      "Oi aluno!",
-    );
+    // Mesmo token, dois valores: a coluna do card na automação, o campo
+    // personalizado na campanha. Quem copia o texto de uma tela para outra
+    // recebe o dado errado (ou nada).
+    expect(renderTemplate("{{lead.title}}", CONTEXTO)).toBe("Negocio X");
+    expect(renderizar("{{lead.title}}", VALORES, QUANDO).texto).toBe("Maria");
+    expect(renderizar("{{lead.title}}", { nome: "Ana" }, QUANDO).faltando).toEqual(["lead.title"]);
   });
 });
 
-describe("os dois lados que o catálogo não pode confundir", () => {
-  it("saudação sem instante não é falta: a prévia mostra o token, o envio resolve", () => {
-    const previa = renderizar("{{saudacao}}, {{nome}}!", VALORES);
-    expect(previa.texto).toBe("{{saudacao}}, Ana Souza!");
-    expect(previa.faltando).toEqual([]);
-    expect(previa.desconhecidas).toEqual([]);
+describe("o que não tem lista fechada está declarado, não fingido", () => {
+  it("proposta: resolve QUALQUER caminho, e o catálogo não finge catalogá-lo", () => {
+    const documento = substituirVariaveis("{{cliente.nome}} — {{valor}}", {
+      cliente: { nome: "Ana" },
+      valor: 10,
+    });
+    expect(documento.textoRenderizado).toBe("Ana — 10");
+    expect(variavelDoCatalogo("{{cliente.nome}}")).toBeNull();
+
+    const declarada = VOCABULARIOS_ABERTOS.find((v) => v.arquivo === PROPOSTA);
+    expect(declarada, `${PROPOSTA} resolve variáveis e não está declarado`).toBeDefined();
+    expect(declarada!.motivo.trim()).not.toBe("");
   });
 
-  it("chave fora do catálogo continua literal nos dois — e não ganha linha", () => {
-    expect(variavelDoCatalogo("{{codigo}}")).toBeNull();
-    expect(interpolateTemplate("Cupom {{codigo}}", CONTATO)).toBe("Cupom {{codigo}}");
-
-    const campanha = renderizar("Cupom {{codigo}}", VALORES, QUANDO);
-    expect(campanha.texto).toBe("Cupom {{codigo}}");
-    expect(campanha.desconhecidas).toEqual(["codigo"]);
+  it("todo vocabulário aberto declarado aponta arquivo que existe e explica o porquê", () => {
+    expect(VOCABULARIOS_ABERTOS.length).toBeGreaterThan(0);
+    for (const aberto of VOCABULARIOS_ABERTOS) {
+      expect(aberto.dialeto.trim()).not.toBe("");
+      expect(aberto.motivo.trim()).not.toBe("");
+      expect(() => fonte(aberto.arquivo), `${aberto.arquivo} não existe`).not.toThrow();
+    }
   });
 
-  it("o dialeto da Meta ({{1}}, {{2}}) é outro e fica fora do catálogo", () => {
-    // Não é descuido: `{{1}}` é posição de variável de modelo aprovado, resolvida
-    // em `lib/channels/meta/variaveis-do-fluxo.ts`. Catalogá-la aqui prometeria
-    // nome onde existe índice.
-    expect(variavelDoCatalogo("{{1}}")).toBeNull();
-    expect(variavelDoCatalogo("{{2}}")).toBeNull();
-    expect(nomesDoCatalogoSemCuringa().some((n) => /^\d+$/.test(n))).toBe(false);
+  it("toda fonte conhecida de `{{...}}` está coberta ou declarada", () => {
+    // A lista é a do produto, escrita uma vez: fonte nova entra aqui na mesma
+    // edição em que nasce, ou o teste não deixa esquecer.
+    const conhecidas = [INBOX, CAMPANHA, AUTOMACAO, FLUXO, SELETOR, PROPOSTA];
+    const declaradas = [
+      ...Object.values(ARQUIVOS_DOS_RESOLVEDORES),
+      ...VOCABULARIOS_ABERTOS.map((v) => v.arquivo),
+    ];
+    for (const arquivo of conhecidas) {
+      expect(() => fonte(arquivo), `${arquivo} sumiu do repositório`).not.toThrow();
+      expect(
+        declaradas,
+        `${arquivo} não está nem coberto por um resolvedor nem declarado em VOCABULARIOS_ABERTOS`,
+      ).toContain(arquivo);
+    }
+  });
+});
+
+describe("as raízes de campo", () => {
+  it("cada raiz do catálogo é aceita pela fonte que a usa", () => {
+    expect(RAIZES_DA_CAMPANHA).toEqual(["lead", "contato"]);
+    for (const raiz of RAIZES_DE_CAMPO) {
+      const entrada = variavelDoCatalogo(`{{${raiz}.campo}}`);
+      expect(entrada, `{{${raiz}.campo}} não está no catálogo`).not.toBeNull();
+      expect(entrada!.nome).toBe(`${raiz}${SUFIXO_DE_CURINGA}`);
+    }
+    // `{{lead}}` sem campo não é variável para ninguém.
+    expect(renderizar("{{lead}}", VALORES, QUANDO).desconhecidas).toEqual(["lead"]);
+    expect(variavelDoCatalogo("{{lead}}")).toBeNull();
   });
 
-  it("token com chaves, espaço e maiúscula é o mesmo nome — o catálogo não é mais exigente que o motor", () => {
-    expect(normalizarToken("{{ NOME }}")).toBe("nome");
-    expect(variavelDoCatalogo("{{ Primeiro_Nome }}")?.nome).toBe("primeiro_nome");
-    expect(normalizarToken("{{lead.custom_fields.gancho}}")).toBe("lead.*");
-    expect(interpolateTemplate("Oi {{ NOME }}", CONTATO)).toBe("Oi Ana Souza");
+  it("`contact.*` é só da automação, `contato.*` só da campanha — e o catálogo diz", () => {
+    expect(variavelDoCatalogo("{{contact.phone_number}}")!.disponivelEm).toEqual(["automacao"]);
+    expect(variavelDoCatalogo("{{contato.gancho}}")!.disponivelEm).toEqual(["campanha"]);
   });
 });
 
@@ -313,38 +530,74 @@ describe("a forma do catálogo", () => {
           v.nome.slice(0, -SUFIXO_DE_CURINGA.length),
         );
       } else {
-        // O `TOKEN` do Inbox aceita só `[a-zA-Z_]`: nome com dígito ou ponto
-        // viraria linha de catálogo que a tela oferece e o Inbox ignora.
         expect(v.nome).toMatch(/^[a-z][a-z_]*$/);
       }
     }
   });
 
-  it("o catálogo é dado puro: nenhum import, nenhum React, nenhum resolvedor", () => {
-    const fonte = readFileSync(CATALOGO, "utf8");
-    expect(fonte).not.toMatch(/^\s*import\s/m);
-    expect(fonte).not.toMatch(/from\s+"react/m);
-    expect(fonte).not.toMatch(/export\s+function\s+(resolver|renderizar|interpolar)\b/);
+  it("todo nome do catálogo tem exemplo de token (senão os testes acima conferem menos)", () => {
+    expect(Object.keys(TOKEN_DE_EXEMPLO).sort()).toEqual([...nomesDoCatalogo()].sort());
   });
 
-  it("declara o que NÃO cobre — os quatro resolvedores restantes, com arquivo que existe", () => {
-    expect(RESOLVEDORES_NAO_COBERTOS).toHaveLength(4);
-    const arquivos = RESOLVEDORES_NAO_COBERTOS.map((r) => r.arquivo);
-    expect(new Set(arquivos).size).toBe(arquivos.length);
-    expect(arquivos).toContain("lib/automation/template.ts");
-    expect(arquivos).toContain("lib/channels/meta/variaveis-do-fluxo.ts");
-    expect(arquivos).toContain("lib/propostas/documento/variaveis.ts");
+  it("o catálogo é dado puro: nenhum import, nenhum React, nenhum resolvedor", () => {
+    const texto = readFileSync(CATALOGO, "utf8");
+    expect(texto).not.toMatch(/^\s*import\s/m);
+    expect(texto).not.toMatch(/from\s+"react/m);
+    expect(texto).not.toMatch(/export\s+function\s+(resolver|renderizar|interpolar)\b/);
+  });
 
-    for (const r of RESOLVEDORES_NAO_COBERTOS) {
-      expect(r.dialeto.trim()).not.toBe("");
-      expect(r.motivo.trim()).not.toBe("");
-      // Declarar arquivo que não existe é a mesma mentira, um nível abaixo.
-      expect(() => readFileSync(join(RAIZ, r.arquivo), "utf8")).not.toThrow();
-    }
+  it("o que o seletor passa por t() tem espanhol: descrição, título de grupo e dica de curinga", () => {
+    // O seletor traduz em runtime (`t(v.descricao)`, `t(ROTULO_DO_GRUPO[g])`):
+    // a varredura de `t("literal")` não enxerga essas chaves, e sem linha no
+    // dicionário a lista sairia em português para quem usa em espanhol.
+    const textos = [
+      ...VARIAVEIS_DO_CATALOGO.map((v) => v.descricao),
+      ...GRUPOS_DE_VARIAVEL.map((g) => ROTULO_DO_GRUPO[g]),
+      ...Object.values(DICA_DO_CURINGA),
+    ];
+    expect(textos.filter((texto) => !DICIONARIO[texto]?.es)).toEqual([]);
+  });
+
+  it("toda raiz de cada fonte está catalogada e toda fonte do catálogo é conhecida", () => {
+    expect([...RESOLVEDORES].sort()).toEqual(["automacao", "campanha", "fluxo", "inbox"]);
+    const fontesUsadas = new Set(VARIAVEIS_DO_CATALOGO.flatMap((v) => v.disponivelEm));
+    expect([...fontesUsadas].sort()).toEqual([...RESOLVEDORES].sort());
+  });
+
+  it("normaliza token como o operador escreve e como o motor lê", () => {
+    expect(normalizarToken("{{ NOME }}")).toBe("nome");
+    expect(normalizarToken('{{nome|"aluno"}}')).toBe("nome");
+    expect(normalizarToken("{{lead.custom_fields.gancho}}")).toBe("lead.*");
+    expect(normalizarToken("{{contact.custom_fields.gancho}}")).toBe("contact.*");
+    expect(variavelDoCatalogo("{{ Primeiro_Nome }}")?.nome).toBe("primeiro_nome");
   });
 });
 
-/** Os nomes do catálogo sem o sufixo de curinga — para checar o formato das chaves. */
-function nomesDoCatalogoSemCuringa(): string[] {
-  return VARIAVEIS_DO_CATALOGO.map((v) => v.nome).filter((nome) => !eCuringa(nome));
-}
+describe("as variáveis exclusivas de cada fonte", () => {
+  it("o Inbox só tem a saudação fora das quatro — e é a única", () => {
+    // `exclusivasDe` = existe nesta fonte e não em todas: é o mapa do que a
+    // pessoa perde ao copiar o texto para outra tela.
+    expect(exclusivasDe("inbox")).toEqual(["saudacao"]);
+  });
+
+  it("campanha, automação e fluxo têm as suas, e são estas", () => {
+    expect([...exclusivasDe("campanha")].sort()).toEqual(
+      ["contato.*", "lead.*", "saudacao"].sort(),
+    );
+    expect([...exclusivasDe("automacao")].sort()).toEqual(
+      ["contact.*", "email", "lead.*", "saudacao", "telefone"].sort(),
+    );
+    expect([...exclusivasDe("fluxo")].sort()).toEqual(["lead.*"].sort());
+  });
+
+  it("`saudacao` é a única chave fechada da campanha além do universal — e agora é das três", () => {
+    expect(exclusivasDe("campanha").filter((v) => !eCuringa(v))).toEqual(["saudacao"]);
+    // #3687: deixou de ser só da campanha. Resolve no Inbox (compositor, fuso de
+    // quem atende), na automação (instante do disparo) e na campanha (relógio).
+    expect([...variavelDoCatalogo("{{saudacao}}")!.disponivelEm].sort()).toEqual([
+      "automacao",
+      "campanha",
+      "inbox",
+    ]);
+  });
+});

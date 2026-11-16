@@ -34,6 +34,7 @@ const COLUNAS: Record<string, readonly string[]> = {
   custo: ["custo", "preco de custo", "preço de custo", "compra", "costo", "coste", "precio de costo", "precio de coste"],
   marca: ["marca", "fabricante"],
   categoria: ["categoria", "tipo", "departamento"],
+  capacidade: ["capacidade", "armazenamento", "capacidad", "almacenamiento"],
   quantidade: ["quantidade", "estoque", "qtd", "qtde", "qty", "cantidad", "existencias", "stock"],
   /**
    * A FOTO POR URL (#3587). Uma coluna só, com um link — ou até 5 separados por
@@ -67,6 +68,9 @@ function normalizarCabecalho(texto: string): string {
     .trim();
 }
 
+/** Os cabeçalhos que DESCREVEM o produto — e que só nomeiam quando estão sozinhos. */
+const DESCREVEM = new Set(["descricao", "descrição", "descripcion", "descripción"].map(normalizarCabecalho));
+
 /** Qual campo do produto esta coluna da planilha representa? */
 function campoDaColuna(cabecalho: string): string | null {
   const alvo = normalizarCabecalho(cabecalho);
@@ -88,6 +92,9 @@ function campoDaColuna(cabecalho: string): string | null {
  * `lib/webhooks/respondi.ts`.
  */
 const LIMITE_DO_CODIGO = 60;
+
+/** O mesmo teto da coluna e do schema (`lib/schemas/produtos.ts`). */
+const LIMITE_DA_CAPACIDADE = 60;
 
 /** 32 bits em hex, zero à esquerda: o tamanho não varia com o valor. */
 const TAMANHO_DA_ASSINATURA = 8;
@@ -203,8 +210,21 @@ export interface LinhaImportada {
   custo_cents: number | null;
   marca?: string;
   categoria?: string;
+  /**
+   * Só existe quando a planilha TEM a coluna e a empresa ligou o campo (célula
+   * vazia vira null). Sem isso a chave some, e reimportar uma planilha antiga
+   * não apaga a capacidade.
+   */
+  capacidade?: string | null;
   quantidade: number;
   controla_estoque: boolean;
+  /**
+   * O texto da coluna de descrição, quando a planilha traz uma AO LADO da de
+   * nome (ver "quem nomeia ganha de quem descreve" em `lerPlanilha`). Ausente =
+   * a planilha não falou de descrição, ou a célula veio vazia: a descrição já
+   * gravada fica — a rota só escreve onde há texto.
+   */
+  descricao?: string;
   /**
    * As URLs das fotos, na ordem da planilha — o que a rota BAIXA e guarda em
    * `catalog-photos`. Ausente quando a planilha não fala de foto: é o que
@@ -229,6 +249,7 @@ export interface ResultadoDaLeitura {
 export function lerPlanilha(
   conteudo: string,
   t?: (text: string) => string,
+  opcoes: { capacidade?: boolean } = {},
 ): ResultadoDaLeitura | { erro: string } {
   const _t = t || ((x) => x);
   const linhas = parseCsv(conteudo).filter((l) => l.some((c) => c.trim() !== ""));
@@ -238,10 +259,37 @@ export function lerPlanilha(
   const mapa = new Map<number, string>();
   const colunasIgnoradas: string[] = [];
   cabecalho.forEach((titulo, i) => {
-    const campo = campoDaColuna(titulo);
+    const coluna = campoDaColuna(titulo);
+    // Campo desligado na empresa: a coluna cai no aviso de colunas não usadas.
+    const campo = coluna === "capacidade" && !opcoes.capacidade ? null : coluna;
     if (campo) mapa.set(i, campo);
     else if (titulo.trim() !== "") colunasIgnoradas.push(titulo.trim());
   });
+
+  // ─── QUEM NOMEIA GANHA DE QUEM DESCREVE, EM QUALQUER ORDEM ────────────────
+  //
+  // `descricao`/`descripcion` caem em `nome` de propósito: a planilha que traz
+  // só essa coluna tem de entrar, e recusá-la seria pior. Mas a planilha que
+  // traz as DUAS — `nome` E `descricao` (ou `nombre` E `descripcion`) — tinha
+  // duas colunas no posto de nome, e o vencedor era o acaso da ordem:
+  //
+  //   nome;descricao;preco  → nome = "Massageador"                       ✔
+  //   descricao;nome;preco  → nome = "Com calor infravermelho e 3 vel…"  ✘
+  //
+  // O segundo é o catálogo inteiro com o título errado, sem erro nenhum na
+  // tela — e o texto da descrição, que é o que o atendente de IA conta ao
+  // cliente, não entrava em lugar nenhum. A coluna que descreve, quando há
+  // outra que nomeia, vira o que ela é: a DESCRIÇÃO do produto.
+  //
+  // Só age com um vencedor claro: com duas colunas que nomeiam (ou duas que
+  // descrevem), não há regra a aplicar e a primeira segue valendo.
+  const indicesDeNome = [...mapa.entries()].filter(([, campo]) => campo === "nome").map(([i]) => i);
+  if (indicesDeNome.length > 1) {
+    const descreve = (i: number) => DESCREVEM.has(normalizarCabecalho(cabecalho[i] ?? ""));
+    if (indicesDeNome.some((i) => !descreve(i))) {
+      for (const i of indicesDeNome) if (descreve(i)) mapa.set(i, "descricao");
+    }
+  }
 
   const campos = new Set(mapa.values());
   // Sem nome ou sem preço não há catálogo — e dizer isso ANTES de processar 300
@@ -319,6 +367,14 @@ export function lerPlanilha(
       continue;
     }
 
+    // Recusa com motivo, como o preço: cortar em silêncio gravaria uma capacidade
+    // que a planilha não disse, e o agente a repetiria ao cliente.
+    const capacidade = valor("capacidade");
+    if (capacidade.length > LIMITE_DA_CAPACIDADE) {
+      erros.push({ linha: numeroNaPlanilha, motivo: _t("capacidade com mais de 60 caracteres") });
+      continue;
+    }
+
     // Célula vazia não declara nada sobre a foto: reimportar a lista de preços
     // não pode apagar a foto que a pessoa subiu pela tela (mesmo cuidado que
     // `descricao` e `ativo` têm na rota). Quem traz link, manda na foto.
@@ -333,6 +389,8 @@ export function lerPlanilha(
     // loja quando o preço muda. O corte em 60 caracteres fica em
     // `codigoDoProduto`: cortar AQUI, antes de colapsar os espaços, fazia dois
     // nomes longos chegarem ao banco com o mesmo código.
+    // 2000 é o teto de `descricao` no schema do produto (`lib/schemas/produtos.ts`).
+    const descricao = valor("descricao").slice(0, 2000).trim();
     const codigo = codigoDoProduto(valor("codigo") || nome);
     const anterior = codigosVistos.get(chaveDoCodigo(codigo));
     if (anterior) {
@@ -369,8 +427,10 @@ export function lerPlanilha(
       custo_cents,
       ...(valor("marca") ? { marca: valor("marca") } : {}),
       ...(valor("categoria") ? { categoria: valor("categoria") } : {}),
+      ...(campos.has("capacidade") ? { capacidade: capacidade || null } : {}),
       quantidade,
       controla_estoque: temColunaEstoque,
+      ...(descricao ? { descricao } : {}),
       ...(fotos.fotos ? { fotos: fotos.fotos } : {}),
     });
   }

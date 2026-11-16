@@ -10,11 +10,13 @@ import { useAuth } from "@/hooks/auth/AuthProvider";
 import { ConnectionHealthDot } from "@/components/connections/ConnectionHealthDot";
 import { ContadorDeCasos } from "@/components/shell/ContadorDeCasos";
 import { ContadorDaFila } from "@/components/shell/ContadorDaFila";
+import { ContadorDeTarefas } from "@/components/shell/ContadorDeTarefas";
 import { VersionFooter } from "@/components/shell/VersionFooter";
 import { LogotipoDoProduto, SimboloDoProduto } from "@/components/branding/MarcaDoProduto";
 import { marcaEhADoProduto } from "@/lib/branding";
 import { useMarcaDaInstalacao } from "@/lib/branding/contexto";
 import { GRUPO_NO_RODAPE, sidebarGroups } from "@/lib/navigation/registry";
+import { classeDoGrupo, classeDoItem } from "@/lib/navigation/classes-estaveis";
 import { usePrefetchPorIntencao } from "@/hooks/navigation/prefetchPorIntencao";
 
 const CHAVE_GRUPOS_FECHADOS = "sidebar-grupos-fechados";
@@ -328,7 +330,12 @@ export function SidebarContent({
           // seus itens — não há onde desenhar cabeçalho nem seta para fechá-lo.
           const aberto = collapsed || !gruposFechados.has(group.id);
           return (
-            <div key={group.id} className="space-y-1">
+            // `nav-grupo` (comum a todo grupo) e `nav-grupo-<id>` são contrato
+            // público: é por elas que o CSS personalizado de /admin/marca, que só
+            // aceita seletor de classe, dá cor ao menu inteiro ou a uma seção dele
+            // (#4463). Renomear quebra a folha de quem já instalou; documentado em
+            // docs/white-label.md.
+            <div key={group.id} className={cn("space-y-1 nav-grupo", classeDoGrupo(group.id))}>
               {/* Colapsado, o sidebar tem 64px: seis rótulos ali seriam ilegíveis.
                   Vira um filete separador, que preserva o agrupamento sem texto. */}
               {collapsed ? (
@@ -372,6 +379,9 @@ export function SidebarContent({
                           aria-current={isActive ? "page" : undefined}
                           onClick={onNavigate}
                           className={cn(
+                            // A classe do DESTINO é contrato estável para o CSS da
+                            // tela Marca (#4463): `nav-item-inbox`, `nav-item-kanban`…
+                            classeDoItem(item.href),
                             "relative flex items-center gap-3 rounded-md px-3 py-1 text-sm transition-colors",
                             isActive
                               ? "bg-accent text-accent-foreground"
@@ -388,6 +398,9 @@ export function SidebarContent({
                           )}
                           {item.contador === "casos" && <ContadorDeCasos compacto={collapsed} />}
                           {item.contador === "fila" && <ContadorDaFila compacto={collapsed} />}
+                          {item.contador === "tarefas" && (
+                            <ContadorDeTarefas compacto={collapsed} />
+                          )}
                         </Link>
                       </li>
                     );
@@ -419,7 +432,7 @@ export function SidebarContent({
           );
         })}
       </nav>
-      <div className="border-t px-2 py-1">
+      <div className={cn("border-t px-2 py-1 nav-grupo", classeDoGrupo(GRUPO_NO_RODAPE))}>
         {rodape && (
           <Link
             href={rodape.href}
@@ -429,6 +442,7 @@ export function SidebarContent({
             onClick={onNavigate}
             className={cn(
               "mb-0.5 flex items-center gap-3 rounded-md px-3 py-1 text-sm transition-colors",
+              classeDoItem(rodape.href),
               pathname.startsWith(rodape.href)
                 ? "bg-accent text-accent-foreground"
                 : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
@@ -452,6 +466,7 @@ export function SidebarContent({
             onClick={onNavigate}
             className={cn(
               "mb-0.5 flex items-center gap-3 rounded-md px-3 py-1 text-sm transition-colors",
+              classeDoItem(ajuda.href),
               pathname.startsWith(ajuda.href)
                 ? "bg-accent text-accent-foreground"
                 : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",

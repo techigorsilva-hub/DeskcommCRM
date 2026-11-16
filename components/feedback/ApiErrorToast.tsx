@@ -5,6 +5,7 @@ import { useT } from "@/hooks/i18n/useT";
 import { traduzir } from "@/lib/i18n/dicionario";
 import { idiomaAtual } from "@/lib/i18n/IdiomaProvider";
 import { ApiError } from "@/lib/api/types";
+import { tipoDeFalha } from "@/lib/api/retentativa";
 
 type Variant = "error" | "warning" | "info";
 
@@ -136,6 +137,21 @@ const COPY: Record<string, { variant: Variant; msg?: string }> = {
 };
 
 /**
+ * `requestId` de um erro que NÃO é `ApiError`.
+ *
+ * O fallback do `toastFor` recebe `unknown` — o que sobrou depois de tudo o que
+ * não é `ApiError` (erro de rede do fetch, erro de um adaptador, um objeto
+ * lançado à mão). Alguns desses trazem `requestId`; quando trazem, o `ID:` tem
+ * de ir para a tela do mesmo jeito, senão o aviso genérico é o único caso em
+ * que quem pede ajuda fica sem o ID que existe no log (#3971).
+ */
+function requestIdDoErro(err: unknown): string | undefined {
+  if (typeof err !== "object" || err === null) return undefined;
+  const id = (err as { requestId?: unknown }).requestId;
+  return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
+/**
  * `t` chega pronto de fora: `showApiError` resolve via `idiomaAtual()` (fora da
  * árvore React), `useApiErrorHandler` via `useT()` (dentro dela). Nenhum dos
  * dois passa `t` como segundo parâmetro de `onError` — o TanStack Query chama
@@ -165,7 +181,30 @@ function toastFor(err: unknown, t: (texto: string) => string): void {
     toast.error(t(err.message) || err.code, { description });
     return;
   }
-  toast.error(t("Erro inesperado. Tente novamente."));
+  const requestId = requestIdDoErro(err);
+  // ─── A FALHA DE TRANSPORTE NÃO É "INESPERADA" (#4508) ────────────────────
+  //
+  // Tempo esgotado e conexão caída chegam aqui como `DOMException`
+  // (`TimeoutError`) e `TypeError`, e caíam no genérico abaixo: a tela dizia
+  // "Erro inesperado. Tente novamente." para um timeout — o texto literal do
+  // relato da issue. Não é inesperado, é transitório, e a espera é parte do
+  // que a frase precisa dizer. `warning`, e não `error`: nada quebrou e tentar
+  // de novo é o caminho.
+  const tipo = tipoDeFalha(err);
+  if (tipo === "tempo_esgotado" || tipo === "sem_conexao") {
+    const texto =
+      tipo === "tempo_esgotado"
+        ? t("A consulta excedeu o tempo limite. Tente de novo.")
+        : t("Sem conexão com o servidor. Verifique a rede e tente de novo.");
+    toast.warning(texto, { description: requestId ? `ID: ${requestId}` : undefined });
+    return;
+  }
+  const generico = t("Erro inesperado. Tente novamente.");
+  if (requestId) {
+    toast.error(generico, { description: `ID: ${requestId}` });
+    return;
+  }
+  toast.error(generico);
 }
 
 /**
